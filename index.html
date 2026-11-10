@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>おてほん</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.9/build/opensheetmusicdisplay.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  /* 習字のお手本の色: 和紙、墨、先生の朱 */
+  :root {
+    --washi:#f1ebde; --sheet:#fffdf6; --sumi:#1d1b18; --sub:#7b7364; --line:#ddd3bd; --shu:#d7402b; --shu-deep:#b02f1d;
+    --pen:"Klee", "Hiragino Mincho ProN", serif;
+    --staff:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='110'%3E%3Cpath d='M0 30.5h10M0 40.5h10M0 50.5h10M0 60.5h10M0 70.5h10' stroke='%23ddd3bd'/%3E%3C/svg%3E");
+    --staff-shu:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='110'%3E%3Cpath d='M0 30.5h10M0 40.5h10M0 50.5h10M0 60.5h10M0 70.5h10' stroke='%23d7402b'/%3E%3C/svg%3E");
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; color:var(--sumi); font:15px/1.7 "Hiragino Sans", -apple-system, sans-serif;
+    background:var(--washi) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='.9' numOctaves='3'/%3E%3CfeColorMatrix values='0 0 0 0 .35 0 0 0 0 .3 0 0 0 0 .2 0 0 0 .07 0'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  h1, h2, h3, p { margin:0; }
+  button, input { font:inherit; color:inherit; }
+  button { cursor:pointer; }
+  :focus-visible, label:has(:focus-visible) { outline:2px solid var(--shu); outline-offset:3px; }
+  [hidden] { display:none !important; }
+  .sub { color:var(--sub); font-size:13px; }
+  .sheet { background:var(--sheet); border-radius:6px; box-shadow:0 1px 0 #fff inset, 0 1px 2px #3a2d1220, 0 12px 32px -12px #3a2d1238; }
+  .btn { display:inline-block; border:1px solid var(--sumi); background:none; border-radius:999px; padding:7px 20px; cursor:pointer; transition:.15s; }
+  .btn:hover { background:var(--sumi); color:var(--sheet); }
+  .btn.go { background:var(--shu); border-color:var(--shu); color:#fff; }
+  .btn.go:hover { background:var(--shu-deep); border-color:var(--shu-deep); }
+  .btn input, .tile input { position:absolute; width:1px; height:1px; opacity:0; }
+
+  header { max-width:1320px; margin:auto; padding:28px 32px 20px; }
+  .logo { display:inline-flex; align-items:center; gap:12px; font:600 30px/1 var(--pen); letter-spacing:.14em; color:inherit; text-decoration:none; }
+  .seal { writing-mode:vertical-rl; background:var(--shu); color:#fff; font:700 12px/1.1 "Hiragino Mincho ProN", serif; letter-spacing:0; padding:5px 3px; border-radius:4px; transform:rotate(-4deg); }
+  main { max-width:1320px; margin:auto; padding:0 32px 160px; }
+
+  /* ---- 曲一覧 ---- */
+  #zone { background:var(--sheet) var(--staff); padding:56px 32px; text-align:center; transition:.2s; }
+  #zone .lead { font:600 24px/1.4 var(--pen); letter-spacing:.06em; }
+  #zone .sub { margin:6px 0 20px; }
+  body.dragging #zone { background-image:var(--staff-shu); }
+  #thumbs { display:flex; flex-wrap:wrap; gap:14px; justify-content:center; list-style:none; padding:0; margin:0 0 22px; counter-reset:pg; }
+  #thumbs li { position:relative; width:104px; counter-increment:pg; }
+  #thumbs img, #thumbs .noimg { width:104px; height:138px; object-fit:cover; object-position:top; border-radius:4px; background:#fff; box-shadow:0 2px 8px #3a2d1230; display:block; }
+  #thumbs .noimg { display:grid; place-items:center; padding:6px; font-size:11px; word-break:break-all; color:var(--sub); }
+  #thumbs li::before { content:counter(pg); position:absolute; left:6px; top:6px; min-width:22px; height:22px; border-radius:11px; background:var(--sumi); color:#fff; font-size:12px; line-height:22px; }
+  #thumbs button { position:absolute; right:-8px; top:-8px; width:24px; height:24px; border-radius:50%; border:none; background:var(--sheet); box-shadow:0 1px 4px #0004; line-height:1; }
+  #stage .rowc { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+  #title { width:min(360px, 100%); border:none; border-bottom:1.5px solid var(--sumi); background:none; padding:6px 4px; font:600 20px var(--pen); text-align:center; }
+  #title::placeholder { color:#b9b09c; }
+  #title:focus-visible { outline:none; border-bottom-color:var(--shu); box-shadow:0 1.5px 0 var(--shu); }
+  #stage p { margin-top:16px; }
+
+  #songs { list-style:none; padding:0; margin:44px 0 0; display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)); gap:36px 28px; }
+  .card { display:block; width:100%; padding:0; border:none; background:none; text-align:left; }
+  .card .thumb { aspect-ratio:3/4; overflow:hidden; background:var(--sheet) var(--staff); transition:transform .25s cubic-bezier(.2,.8,.2,1), box-shadow .25s; }
+  .card:hover .thumb { transform:translateY(-6px) rotate(-.8deg); box-shadow:0 1px 2px #3a2d1220, 0 24px 40px -14px #3a2d1255; }
+  .card img { width:100%; height:100%; object-fit:cover; object-position:top; display:block; }
+  .card strong { display:block; margin-top:14px; font:600 17px/1.4 var(--pen); }
+  .busy::before { content:""; display:inline-block; width:7px; height:7px; margin-right:6px; border-radius:50%; background:var(--shu); animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity:.25; } }
+
+  /* ---- 曲 ---- */
+  .phead { display:flex; align-items:baseline; gap:16px; margin-bottom:20px; }
+  #back { border:none; background:none; font-size:22px; padding:0 4px; }
+  #songTitle { font:600 28px/1.3 var(--pen); letter-spacing:.04em; }
+  .cols { display:grid; grid-template-columns:minmax(0, 1fr) 320px; gap:32px; align-items:start; }
+  @media (max-width:980px) { .cols { grid-template-columns:minmax(0, 1fr); } }
+  #score { position:relative; overflow:hidden; cursor:pointer; min-height:160px; user-select:none; -webkit-user-select:none; }
+  #score .lit path { fill:var(--shu); stroke:var(--shu); }
+  .sel { position:absolute; background:#d7402b18; border-left:2px solid var(--shu); pointer-events:none; mix-blend-mode:multiply; }
+  .hint { margin-top:12px; }
+  #waiting { position:relative; overflow:hidden; max-width:560px; margin:0 auto; }
+  #waiting img { width:100%; display:block; }
+  #waiting.scan::after { content:""; position:absolute; left:0; right:0; height:90px; top:-90px; background:linear-gradient(transparent, #d7402b30 85%, var(--shu)); animation:scan 2.6s linear infinite; }
+  @keyframes scan { to { top:100%; } }
+  #waitText { text-align:center; margin-top:18px; font:600 17px var(--pen); }
+
+  aside { position:sticky; top:20px; max-height:calc(100vh - 150px); overflow:auto; padding-right:4px; }
+  aside h3 { font:600 15px var(--pen); letter-spacing:.2em; margin:26px 0 10px; }
+  aside h3:first-of-type { margin-top:0; }
+  #status { margin-bottom:22px; font-size:14px; }
+  #thread { list-style:none; padding:0; margin:0; }
+  #thread li { margin-bottom:16px; font-size:13.5px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  #thread .proof, #thread .fix .ans { border-left:2px solid var(--shu); padding-left:12px; }  /* 朱入れ */
+  #thread .tag { display:block; font-size:12px; color:var(--shu-deep); letter-spacing:.08em; }
+  #thread .ask { background:var(--sumi); color:var(--sheet); border-radius:14px 14px 2px 14px; padding:8px 12px; margin:0 0 8px 28px; }
+  #thread .error { color:var(--shu-deep); }
+  #fix { display:flex; gap:8px; margin-top:6px; }
+  #instruction { flex:1; min-width:0; border:1px solid var(--line); border-radius:999px; background:var(--sheet); padding:8px 14px; }
+  #fix .btn { padding:7px 16px; }
+  #pages { display:flex; flex-wrap:wrap; gap:10px; }
+  #pages a, .tile { width:64px; height:86px; border-radius:3px; overflow:hidden; box-shadow:0 1px 5px #3a2d1230; background:var(--sheet); }
+  #pages img { width:100%; height:100%; object-fit:cover; object-position:top; display:block; }
+  .tile { display:grid; place-items:center; font-size:24px; color:var(--sub); border:1px dashed var(--line); box-shadow:none; cursor:pointer; }
+  #del { margin-top:30px; border:none; background:none; padding:0; color:var(--sub); font-size:13px; text-decoration:underline; text-underline-offset:3px; }
+  #del:hover { color:var(--shu-deep); }
+
+  /* ---- 再生コンソール ---- */
+  #bar { position:fixed; left:50%; bottom:22px; transform:translateX(-50%); width:max-content; max-width:calc(100% - 32px); display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:10px 18px;
+    background:var(--sumi); color:#f1ebde; border-radius:36px; padding:10px 24px 12px 10px; box-shadow:0 18px 44px -10px #000a; font-size:13.5px; }
+  #play { width:54px; height:54px; border-radius:50%; border:none; background:var(--shu); display:grid; place-items:center; transition:transform .12s, background .15s; }
+  #play:hover { background:#e64a33; }
+  #play:active { transform:scale(.93); }
+  #play:disabled { background:#55504a; cursor:default; }
+  #play svg { width:22px; height:22px; fill:#fff; }
+  #bar label { display:flex; align-items:center; gap:8px; white-space:nowrap; }
+  #bpm { font:600 17px var(--pen); min-width:2.2em; font-variant-numeric:tabular-nums; }
+  #tempo { width:130px; accent-color:var(--shu); }
+  .seg { display:flex; border:none; margin:0; padding:3px; border-radius:999px; background:#ffffff16; }
+  .seg label, .tog { padding:5px 13px; border-radius:999px; cursor:pointer; transition:.15s; }
+  .seg input, .tog input { position:absolute; opacity:0; pointer-events:none; }
+  .seg label:has(:checked) { background:#f1ebde; color:var(--sumi); }
+  .tog { border:1px solid #ffffff3a; }
+  .tog:has(:checked) { background:var(--shu); border-color:var(--shu); color:#fff; }
+  .span { display:flex; align-items:center; gap:6px; }
+  .span input { width:42px; text-align:center; background:none; border:none; border-bottom:1px solid #ffffff55; padding:2px 0; -moz-appearance:textfield; }
+  .span input::-webkit-inner-spin-button { display:none; }
+  #all { border:none; background:none; color:#f1ebde99; text-decoration:underline; text-underline-offset:3px; padding:0 0 0 4px; }
+  #progress { position:absolute; left:36px; right:36px; bottom:5px; height:2px; background:#ffffff1c; border-radius:2px; overflow:hidden; }
+  #progress i { display:block; height:100%; width:0; background:var(--shu); }
+
+  /* ---- ドロップの幕、できましたの丸 ---- */
+  #veil { position:fixed; inset:14px; z-index:10; display:grid; place-items:center; border:2px dashed var(--shu); border-radius:14px; background:#f1ebdee8; font:600 26px var(--pen); letter-spacing:.08em; pointer-events:none; }
+  #toast { position:fixed; top:26px; left:50%; transform:translateX(-50%); z-index:11; display:flex; align-items:center; gap:10px; background:var(--sheet); border-radius:999px; padding:8px 22px 8px 12px; box-shadow:0 10px 30px -8px #3a2d1266; font:600 16px var(--pen); animation:drop .35s cubic-bezier(.2,.9,.3,1.3); }
+  #toast svg { width:34px; height:34px; }
+  #toast path { fill:none; stroke:var(--shu); stroke-width:3.2; stroke-linecap:round; stroke-dasharray:1; stroke-dashoffset:1; animation:maru .55s .15s ease-out forwards; }
+  @keyframes maru { to { stroke-dashoffset:0; } }
+  @keyframes drop { from { opacity:0; transform:translate(-50%, -16px); } }
+  @media (prefers-reduced-motion:reduce) {
+    *, *::after, *::before { animation:none !important; transition:none !important; }
+    #toast path { stroke-dashoffset:0; }
+  }
+</style>
+</head>
+<body>
+<header><a class="logo" href="#"><span class="seal" aria-hidden="true">手本</span><h1 style="font:inherit">おてほん</h1></a></header>
+
+<main id="library">
+  <section id="zone" class="sheet">
+    <div id="idle">
+      <p class="lead">楽譜の写真かPDFをここに置く</p>
+      <p class="sub">写真は1ページにつき1枚。PDFは全ページを取り込みます。<br>JPEG・PNG・HEIC・PDF ／ ⌘V でも貼れます</p>
+      <label class="btn">ファイルを選ぶ<input type="file" id="files" accept="image/*,.heic,.heif,application/pdf" multiple></label>
+    </div>
+    <p id="opening" class="sub busy" role="status" hidden>PDFを開いています</p>
+    <form id="stage" hidden>
+      <ol id="thumbs"></ol>
+      <p class="rowc"><input type="text" id="title" placeholder="曲名" aria-label="曲名" maxlength="100"></p>
+      <p class="sub">ファイル名の順に読みます。ページを足すときは、そのまま置いてください。</p>
+      <p class="rowc"><button class="btn go" id="send">読み取る</button><button type="button" class="btn" id="cancel">やめる</button></p>
+      <p class="sub" id="stageMsg" role="status"></p>
+    </form>
+  </section>
+  <ul id="songs"></ul>
+</main>
+
+<main id="player" hidden>
+  <div class="phead">
+    <button id="back" aria-label="曲一覧へ戻る">←</button>
+    <h2 id="songTitle"></h2>
+    <span id="songMeta" class="sub"></span>
+  </div>
+  <div class="cols">
+    <section>
+      <div id="waitBox" hidden>
+        <div id="waiting" class="sheet"><img id="waitImg" alt="読み取り中のページ"></div>
+        <p id="waitText" role="status"></p>
+      </div>
+      <div id="scoreBox" hidden>
+        <div id="score" class="sheet" aria-label="楽譜"></div>
+        <p class="hint sub">小節をクリックすると、そこから始まります。Shift＋クリックで終わりの小節を決められます。</p>
+      </div>
+    </section>
+    <aside>
+      <p id="status" class="busy" role="status" hidden></p>
+      <h3>校正</h3>
+      <ol id="thread"></ol>
+      <form id="fix">
+        <input type="text" id="instruction" placeholder="12小節目の右手、最初のファはシャープ" aria-label="直してほしいところ" maxlength="1000">
+        <button class="btn">直す</button>
+      </form>
+      <h3>写真</h3>
+      <div id="pages"></div>
+      <button id="del">この曲を削除</button>
+    </aside>
+  </div>
+
+  <div id="bar" role="group" aria-label="再生">
+    <button id="play" aria-label="再生" disabled></button>
+    <label>♩<output id="bpm">80</output><input type="range" id="tempo" min="30" max="220" value="80" aria-label="テンポ"></label>
+    <fieldset class="seg" aria-label="弾く手">
+      <label><input type="radio" name="hands" value="both" checked>両手</label>
+      <label><input type="radio" name="hands" value="r">右手</label>
+      <label><input type="radio" name="hands" value="l">左手</label>
+    </fieldset>
+    <label class="tog"><input type="checkbox" id="loop">ループ</label>
+    <label class="tog"><input type="checkbox" id="metro">メトロノーム</label>
+    <div class="span">小節<input type="number" id="from" min="1" value="1" aria-label="始まりの小節">–<input type="number" id="to" min="1" value="1" aria-label="終わりの小節"><button id="all" hidden>全曲</button></div>
+    <div id="progress"><i></i></div>
+  </div>
+</main>
+
+<div id="veil" hidden></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+async function api(path = '', opt) {
+  const r = await fetch('/api/songs' + path, opt);
+  if (!r.ok) throw new Error((await r.json()).error);
+  return r;
+}
+const pageUrl = (id, n) => `/api/songs/${id}/pages/${n}`;
+const count = m => (m.measures ? m.measures + '小節 · ' : '') + m.pages + 'ページ';
+
+let song = null, pollTimer = null;
+
+// 画面はURLの # で切り替える (ブラウザの戻るが効く)
+function route() {
+  stop(); clearInterval(pollTimer); song = null; loaded = false;
+  const id = location.hash.slice(1);
+  $('#library').hidden = !!id; $('#player').hidden = !id;
+  id ? openSong(id) : showLibrary();
+}
+addEventListener('hashchange', route);
+$('#back').onclick = () => location.hash = '';
+
+// ---------- 曲一覧 ----------
+async function showLibrary() {
+  const list = await (await api()).json();
+  $('#songs').replaceChildren(...list.map(m => {
+    const img = el('img', { src: pageUrl(m.id, 1), alt: '', loading: 'lazy' });
+    img.onerror = () => img.remove();
+    const card = el('button', { className: 'card' },
+      el('div', { className: 'thumb sheet' }, img),
+      el('strong', {}, m.title),
+      el('span', { className: 'sub' + (m.pending ? ' busy' : '') }, m.pending ? '読み取り中' : count(m)));
+    card.onclick = () => location.hash = m.id;
+    return el('li', {}, card);
+  }));
+  if (list.some(m => m.pending)) pollTimer = setTimeout(() => song || showLibrary(), 3000);
+}
+
+// 置かれた写真はいったん並べて見せ、曲名を付けてから読み取る
+let staged = [];
+function stage(files) {
+  staged.push(...files);
+  staged.sort((a, b) => a.name.localeCompare(b.name, 'ja', { numeric: true }));
+  renderStage();
+}
+function renderStage() {
+  $('#idle').hidden = !!staged.length; $('#stage').hidden = !staged.length;
+  $('#thumbs').replaceChildren(...staged.map(f => {
+    const img = el('img', { src: URL.createObjectURL(f), alt: f.name });
+    img.onerror = () => img.replaceWith(el('div', { className: 'noimg' }, f.name));  // HEIC はブラウザによって表示できない
+    const x = el('button', { type: 'button', ariaLabel: f.name + ' を外す' }, '×');
+    x.onclick = () => { staged = staged.filter(g => g !== f); renderStage(); };
+    return el('li', {}, img, x);
+  }));
+  if (staged.length) $('#title').focus();
+}
+$('#files').onchange = e => { take(e.target.files); e.target.value = ''; };
+$('#cancel').onclick = () => { staged = []; renderStage(); };
+
+async function upload(id, files, say) {
+  for (const [i, f] of files.entries()) {
+    say(`写真を送っています ${i + 1}/${files.length}`);
+    song = await (await api(`/${id}/pages`, { method: 'POST', body: f })).json();
+  }
+}
+$('#stage').onsubmit = async e => {
+  e.preventDefault();
+  $('#send').disabled = true;
+  try {
+    const m = await (await api('', { method: 'POST', body: JSON.stringify({ title: $('#title').value }) })).json();
+    await upload(m.id, staged, t => $('#stageMsg').textContent = t);
+    staged = []; $('#title').value = ''; $('#stageMsg').textContent = ''; renderStage();
+    location.hash = m.id;
+  } catch (err) { $('#stageMsg').textContent = err.message; }
+  $('#send').disabled = false;
+};
+
+// ドロップと貼り付けは画面のどこでも受ける。曲を開いているときは、その曲にページを足す。
+const isImage = f => /^image\//.test(f.type) || /\.hei[cf]$/i.test(f.name);
+const isPdf = f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
+
+// PDF はブラウザの中で1ページずつ画像にして、写真と同じ扱いにする
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+async function pdfPages(file) {
+  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+  const pages = [];
+  for (let n = 1; n <= pdf.numPages; n++) {
+    const page = await pdf.getPage(n);
+    const viewport = page.getViewport({ scale: 2000 / page.getViewport({ scale: 1 }).width });  // 横2000pxあれば五線が十分に読める
+    const canvas = el('canvas', { width: viewport.width, height: viewport.height });
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    const blob = await new Promise(done => canvas.toBlob(done, 'image/jpeg', 0.92));
+    pages.push(new File([blob], `${file.name}-p${String(n).padStart(3, '0')}.jpg`, { type: 'image/jpeg' }));
+  }
+  return pages;
+}
+
+async function take(fileList) {
+  const picked = [...fileList].filter(f => isImage(f) || isPdf(f));
+  if (!picked.length) return;
+  const busy = song ? $('#status') : $('#opening');
+  let files;
+  try {
+    if (picked.some(isPdf)) { busy.hidden = false; busy.textContent = 'PDFを開いています'; }
+    files = (await Promise.all(picked.map(f => isPdf(f) ? pdfPages(f) : [f]))).flat();
+  } catch {
+    return alert('PDFを開けませんでした。パスワード付きのPDFは読めません。');
+  } finally {
+    if (song) render(); else busy.hidden = true;
+  }
+  if (!song) {
+    const pdf = picked.find(isPdf);
+    if (pdf && !$('#title').value) $('#title').value = pdf.name.replace(/\.pdf$/i, '');  // PDFのファイル名を曲名の初期値に
+    return stage(files);
+  }
+  upload(song.id, files, t => { $('#status').hidden = false; $('#status').textContent = t; }).catch(err => alert(err.message)).finally(render);
+}
+let dragDepth = 0;
+const veil = on => { document.body.classList.toggle('dragging', on); $('#veil').hidden = !on || !song; $('#veil').textContent = song ? `「${song.title}」にページを足す` : ''; };
+addEventListener('dragenter', e => { if (e.dataTransfer.types.includes('Files')) { dragDepth++; veil(true); } });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; veil(false); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; veil(false); take(e.dataTransfer.files); });
+addEventListener('paste', e => { if (e.clipboardData.files.length) { e.preventDefault(); take(e.clipboardData.files); } });
+
+// ---------- 曲を開く ----------
+const osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay($('#score'), {
+  autoResize: false, drawTitle: false, drawSubtitle: false, drawComposer: false, drawPartNames: false,
+  drawMeasureNumbers: true, measureNumberInterval: 1, followCursor: true,
+  cursorsOptions: [{ type: 0, color: '#d7402b', alpha: 0.18, follow: true }],
+});
+
+async function openSong(id) {
+  $('#scoreBox').hidden = true; $('#play').disabled = true;
+  try { song = await (await api('/' + id)).json(); } catch { return location.hash = ''; }
+  render();
+  await loadScore();
+  pollTimer = setInterval(poll, 2000);
+}
+
+async function poll() {
+  if (!song || !song.pending) return;
+  const before = song.pending;
+  song = await (await api('/' + song.id)).json();
+  render();
+  if (song.pending === before) return;
+  await loadScore();
+  const last = song.log.at(-1);
+  if (!song.pending && last && last.kind !== 'error') toast(last.kind === 'fix' ? '直しました' : '読み取りました');
+}
+
+const stepText = s => !s ? '順番を待っています' : s.phase === 'omr' ? `${s.page}ページ目を読み取っています`
+  : s.phase === 'proof' ? `${s.page}ページ目を写真と照合しています` : '直しています';
+const plain = t => t.replace(/[`*]/g, '');  // Claude の返事に混ざるMarkdown記号を落とす
+
+function render() {
+  if (!song) return;
+  $('#songTitle').textContent = song.title;
+  $('#songMeta').textContent = count(song);
+  $('#status').hidden = !song.pending;
+  $('#status').textContent = stepText(song.step);
+  // 楽譜がまだ無いあいだは、読み取っている写真を見せる
+  $('#waitBox').hidden = loaded;
+  if (!loaded) {
+    if (song.pages) $('#waitImg').src = pageUrl(song.id, 1);
+    $('#waiting').classList.toggle('scan', !!song.pending);
+    $('#waitText').textContent = song.pending ? stepText(song.step) : '楽譜を読み取れませんでした';
+  }
+  $('#thread').replaceChildren(...song.log.map(e => {
+    const tag = e.page && el('span', { className: 'tag' }, e.page + 'ページ目');
+    if (e.kind === 'proof') return el('li', { className: 'proof' }, tag, plain(e.text));
+    if (e.kind === 'skip') return el('li', { className: 'sub' }, tag, '写真との照合はできませんでした。読み取ったままの楽譜です。\n' + e.text);
+    if (e.kind === 'fix') return el('li', { className: 'fix' }, el('p', { className: 'ask' }, e.ask), el('p', { className: 'ans' }, plain(e.text)));
+    return el('li', { className: 'error' }, e.text);
+  }));
+  if (!song.log.length) $('#thread').append(el('li', { className: 'sub' }, '写真と違って聞こえたら、下に書いてください。'));
+  const add = el('label', { className: 'tile', ariaLabel: 'ページを足す' }, '＋', el('input', { type: 'file', accept: 'image/*,.heic,.heif,application/pdf', multiple: true }));
+  add.firstElementChild.onchange = e => take(e.target.files);
+  $('#pages').replaceChildren(...Array.from({ length: song.pages }, (_, i) =>
+    el('a', { href: pageUrl(song.id, i + 1), target: '_blank', ariaLabel: `${i + 1}ページ目の写真を開く` }, el('img', { src: pageUrl(song.id, i + 1), alt: '', loading: 'lazy' }))), add);
+}
+
+async function loadScore() {
+  stop();
+  let xml;
+  try { xml = await (await api(`/${song.id}/score`)).text(); } catch { return; }
+  $('#scoreBox').hidden = false;
+  await osmd.load(xml);
+  layout();
+  buildTimeline();
+  flags = parseFlags(xml);
+  if (flags.length !== measures.length) flags = measures.map(() => ({ times: 2 }));
+  osmd.cursor.show();
+  $('#from').max = $('#to').max = measures.length;
+  $('#from').value = 1; $('#to').value = measures.length;
+  if (osmd.Sheet.HasBPMInfo) setTempo(Math.round(osmd.Sheet.DefaultStartTempoInBpm));
+  loaded = true; $('#play').disabled = false;
+  render();
+  rangeChanged();
+}
+function layout() {
+  osmd.zoom = Math.min(0.95, Math.max(0.55, $('#score').clientWidth / 1050));
+  osmd.render();
+}
+
+$('#del').onclick = async () => {
+  if (!confirm(`「${song.title}」を削除します。元に戻せません。`)) return;
+  await api('/' + song.id, { method: 'DELETE' });
+  location.hash = '';
+};
+$('#fix').onsubmit = async e => {
+  e.preventDefault();
+  try {
+    song = await (await api(`/${song.id}/fix`, { method: 'POST', body: JSON.stringify({ instruction: $('#instruction').value }) })).json();
+    $('#instruction').value = ''; render();
+  } catch (err) { alert(err.message); }
+};
+
+// 読み取りや修正が終わったら、朱の丸をひとつ
+function toast(text) {
+  $('#toast')?.remove();
+  const t = el('div', { id: 'toast', role: 'status' });
+  t.innerHTML = '<svg viewBox="0 0 40 40" aria-hidden="true"><path pathLength="1" d="M23 6C12 3 4 11 5 21s9 15 18 13 13-10 11-19S25 4 15 8"/></svg>';
+  t.append(text);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2600);
+}
+
+// ---------- 再生 ----------
+// 時刻 t は全音符を1とする位置。秒への変換は再生時のテンポで行うので、再生中にテンポを変えられる。
+// 繰り返しを展開した「演奏上の位置」で数える (events / playDur)。steps / measures は楽譜上の並び。
+let loaded = false, steps = [], events = [], measures = [], flags = [], playDur = 0;
+let playing = false, idx = 0, nextT = 0, timer = null, endTimer = null, cursorAt = 0;
+
+const urls = { A0: 'A0.mp3', C8: 'C8.mp3' };
+for (let o = 1; o <= 7; o++) for (const [n, f] of [['C', 'C'], ['D#', 'Ds'], ['F#', 'Fs'], ['A', 'A']]) urls[n + o] = f + o + '.mp3';
+const hall = new Tone.Reverb({ decay: 2.2, wet: 0.16 }).toDestination();  // 部屋の響きを少しだけ
+const piano = new Tone.Sampler({ urls, release: 1, baseUrl: 'https://tonejs.github.io/audio/salamander/' }).connect(hall);
+const click = new Tone.Synth({ oscillator: { type: 'square' }, envelope: { attack: 0.001, decay: 0.05, sustain: 0, release: 0.01 }, volume: -14 }).toDestination();
+const ICON = { play: '<svg viewBox="0 0 24 24"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z"/></svg>', stop: '<svg viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="2"/></svg>' };
+$('#play').innerHTML = ICON.play;
+
+function buildTimeline() {
+  measures = osmd.Sheet.SourceMeasures.map(m => ({
+    t: m.AbsoluteTimestamp.RealValue, dur: m.Duration.RealValue,
+    num: m.ActiveTimeSignature.Numerator, den: m.ActiveTimeSignature.Denominator, steps: [],
+  }));
+  steps = [];
+  osmd.cursor.reset();
+  const it = osmd.cursor.Iterator.clone();
+  while (!it.EndReached) {
+    const notes = [];
+    for (const ve of it.CurrentVoiceEntries) for (const n of ve.Notes) {
+      if (n.isRest()) continue;
+      let len = n.Length.RealValue;
+      if (n.NoteTie) {  // タイは先頭の音だけ鳴らし、長さを合算する
+        if (n.NoteTie.StartNote !== n) continue;
+        len = n.NoteTie.Duration.RealValue;
+      }
+      notes.push({ midi: n.halfTone + 12, len: Math.max(len, 1 / 32), staff: n.ParentStaff.idInMusicSheet });
+    }
+    measures[it.CurrentMeasureIndex].steps.push(steps.length);
+    steps.push({ t: it.currentTimeStamp.RealValue, at: it.currentTimeStamp.clone(), notes });
+    it.moveToNext();
+  }
+  cursorAt = 0;
+}
+
+// MusicXML から小節ごとの繰り返し・ジャンプ指示を読む
+function parseFlags(xml) {
+  const part = new DOMParser().parseFromString(xml, 'application/xml').querySelector('part');
+  let open = null;
+  const flags = [...part.querySelectorAll(':scope > measure')].map(m => {
+    const f = { times: 2 };
+    for (const r of m.querySelectorAll('barline > repeat')) {
+      if (r.getAttribute('direction') === 'forward') f.fwd = true;
+      else { f.back = true; f.times = +r.getAttribute('times') || 2; }
+    }
+    const ends = [...m.querySelectorAll('barline > ending')];
+    const st = ends.find(e => e.getAttribute('type') === 'start');
+    if (st) open = ((st.getAttribute('number') || '1').match(/\d+/g) || [1]).map(Number);
+    if (open) f.endings = open;
+    if (f.back || ends.some(e => e.getAttribute('type') !== 'start')) open = null;  // 括弧はここまで
+    for (const s of m.querySelectorAll('sound'))
+      for (const k of ['dacapo', 'dalsegno', 'segno', 'coda', 'tocoda', 'fine']) if (s.hasAttribute(k)) f[k] = true;
+    // <sound> が無く、文字や記号だけで書かれている場合
+    const words = [...m.querySelectorAll('words')].map(e => e.textContent).join(' ');
+    if (/\bD\.\s?C\.|da capo/i.test(words)) f.dacapo = true;
+    if (/\bD\.\s?S\.|dal segno/i.test(words)) f.dalsegno = true;
+    if (/to coda/i.test(words)) f.tocoda = true;
+    if (/\bfine\b/i.test(words) && !/al fine/i.test(words)) f.fine = true;
+    if (m.querySelector('direction-type > segno')) f.segno = true;
+    if (m.querySelector('direction-type > coda')) f.codaSym = true;
+    return f;
+  });
+  // コーダ記号だけのとき: 最後の記号がコーダ本体、最初の記号が「To Coda」
+  const syms = flags.filter(f => f.codaSym && !f.coda && !f.tocoda);
+  if (syms.length && !flags.some(f => f.coda)) syms.pop().coda = true;
+  if (syms.length && !flags.some(f => f.tocoda)) syms[0].tocoda = true;
+  // 連続する括弧 (1. 2. …) をひとまとまりにして、最後の括弧と繰り返し回数を決める
+  for (let i = 0; i < flags.length; i++) {
+    if (!flags[i].endings || (i && flags[i - 1].endings)) continue;
+    let j = i, max = 0;
+    for (; j < flags.length && flags[j].endings; j++) max = Math.max(max, ...flags[j].endings);
+    for (const g of flags.slice(i, j)) {
+      g.lastEnding = g.endings.includes(max);
+      if (g.back && !g.lastEnding) g.times = max;
+    }
+  }
+  return flags;
+}
+
+// 小節 a〜b を楽譜の指示どおりにたどった演奏順 (小節番号の列)。
+// D.C. / D.S. の後は慣例どおり繰り返しを省き、最後の括弧を通る。
+function playOrder(a, b) {
+  const order = [];
+  let i = a, start = a, pass = 1, jumped = false;
+  while (i <= b && order.length < 20 * flags.length) {
+    const f = flags[i];
+    // 新しい繰り返し区間の始まり: 前方リピート、または括弧を抜けた直後
+    if (start !== i && (f.fwd || (!f.endings && i > a && flags[i - 1].endings && pass > 1))) { start = i; pass = 1; }
+    if (f.endings && !(jumped ? f.lastEnding : f.endings.includes(pass))) { i++; continue; }
+    order.push(i);
+    if (jumped && f.fine) break;
+    if (jumped && f.tocoda) {
+      const c = flags.findIndex((g, k) => k > i && g.coda);
+      if (c > i && c <= b) { i = c; continue; }
+    }
+    if (f.back && !jumped && pass < f.times) { pass++; i = start; continue; }
+    if (f.back) { start = i + 1; pass = 1; }
+    if (!jumped && (f.dacapo || f.dalsegno)) {
+      const to = f.dacapo ? 0 : flags.findIndex(g => g.segno);
+      if (to >= a && to <= b) { jumped = true; i = start = to; pass = 1; continue; }
+    }
+    i++;
+  }
+  return order;
+}
+
+function buildEvents() {
+  events = []; playDur = 0;
+  for (const mi of playOrder(A(), B())) {
+    const m = measures[mi];
+    for (const i of m.steps) events.push({ t: playDur + steps[i].t - m.t, step: i });
+    // メトロノームは拍子の分母ごとに1拍
+    for (let k = 0; k / m.den < m.dur - 1e-9; k++) events.push({ t: playDur + k / m.den, click: k ? 'G5' : 'C6' });
+    playDur += m.dur;
+  }
+  events.sort((x, y) => x.t - y.t);
+}
+
+const spw = () => 240 / +$('#tempo').value;  // 全音符1つの秒数
+const A = () => Math.min(Math.max(+$('#from').value || 1, 1), measures.length) - 1;
+const B = () => Math.max(Math.min(+$('#to').value || measures.length, measures.length) - 1, A());
+const hands = () => $('[name=hands]:checked').value;
+
+function moveCursor(i) {
+  if (i === cursorAt + 1) osmd.cursor.next();
+  else if (i !== cursorAt) {  // 繰り返しなどで飛ぶときは、その位置のイテレータを作り直す
+    osmd.cursor.iterator = new opensheetmusicdisplay.MusicPartManagerIterator(osmd.Sheet, steps[i].at);
+    osmd.cursor.update();
+  }
+  cursorAt = i;
+  // いま鳴っている音符を朱で塗る
+  document.querySelectorAll('#score .lit').forEach(g => g.classList.remove('lit'));
+  if (playing) for (const g of osmd.cursor.GNotesUnderCursor()) if (!g.sourceNote.isRest()) g.getSVGGElement()?.classList.add('lit');
+}
+
+function fire(e, time) {
+  if (e.click) { if ($('#metro').checked) click.triggerAttackRelease(e.click, 0.03, time); return; }
+  for (const n of steps[e.step].notes) {
+    if (hands() === (n.staff ? 'r' : 'l')) continue;
+    piano.triggerAttackRelease(Tone.Frequency(n.midi, 'midi').toNote(), n.len * spw(), time, n.staff ? 0.7 : 0.85);
+  }
+  Tone.Draw.schedule(() => {
+    if (!playing) return;
+    moveCursor(e.step);
+    $('#progress i').style.width = 100 * e.t / playDur + '%';
+  }, time);
+}
+
+function tick() {  // 少し先までの音を Web Audio の時計で予約する
+  while (playing && nextT < Tone.now() + 0.15) {
+    const e = events[idx];
+    fire(e, nextT);
+    const next = events[idx + 1];
+    if (next) { nextT += (next.t - e.t) * spw(); idx++; continue; }
+    nextT += (playDur - e.t) * spw();
+    if ($('#loop').checked) { idx = 0; continue; }
+    clearInterval(timer);
+    endTimer = setTimeout(stop, (nextT - Tone.now()) * 1000);
+    return;
+  }
+}
+
+async function play() {
+  await Tone.start();
+  $('#play').disabled = true;
+  await Tone.loaded();
+  $('#play').disabled = false;
+  playing = true; $('#play').innerHTML = ICON.stop; $('#play').ariaLabel = '停止';
+  idx = 0;
+  nextT = Tone.now() + 0.1;
+  if ($('#metro').checked) {  // 1小節ぶんのカウントイン
+    const m = measures[A()], beat = spw() / m.den;
+    for (let k = 0; k < m.num; k++) click.triggerAttackRelease(k ? 'G5' : 'C6', 0.03, nextT + k * beat);
+    nextT += m.num * beat;
+  }
+  timer = setInterval(tick, 25);
+  tick();
+}
+
+function stop() {
+  clearInterval(timer); clearTimeout(endTimer);
+  if (playing) piano.releaseAll();
+  playing = false; $('#play').innerHTML = ICON.play; $('#play').ariaLabel = '再生';
+  $('#progress i').style.width = 0;
+  if (loaded) rangeChanged();
+}
+
+$('#play').onclick = () => playing ? stop() : play();
+document.onkeydown = e => { if (e.code === 'Space' && loaded && !/INPUT|BUTTON/.test(e.target.tagName)) { e.preventDefault(); $('#play').click(); } };
+
+function setTempo(v) { $('#tempo').value = v; $('#bpm').textContent = $('#tempo').value; }
+$('#tempo').oninput = () => setTempo($('#tempo').value);
+
+// ---------- 小節の範囲 ----------
+function measureBox(i) {
+  const row = (osmd.GraphicSheet.MeasureList[i] || []).filter(Boolean);
+  if (!row.length) return null;
+  const z = 10 * osmd.zoom, a = row[0].PositionAndShape, b = row[row.length - 1].PositionAndShape;
+  return { x: a.AbsolutePosition.x * z, y: a.AbsolutePosition.y * z, w: a.Size.width * z, h: (b.AbsolutePosition.y + 4 - a.AbsolutePosition.y) * z };
+}
+
+function rangeChanged() {
+  buildEvents();
+  const first = events.find(e => e.step != null);
+  moveCursor(first ? first.step : 0);
+  document.querySelectorAll('.sel').forEach(s => s.remove());
+  const whole = A() === 0 && B() === measures.length - 1;
+  $('#all').hidden = whole;
+  if (whole) return;
+  for (let i = A(); i <= B(); i++) {
+    const r = measureBox(i);
+    if (!r) continue;
+    const s = el('div', { className: 'sel' });
+    Object.assign(s.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+    if (i !== A()) s.style.borderLeft = 'none';
+    $('#score').append(s);
+  }
+}
+$('#from').onchange = $('#to').onchange = stop;
+$('#all').onclick = () => { $('#from').value = 1; $('#to').value = measures.length; stop(); };
+
+$('#score').onmousedown = e => { if (e.shiftKey) e.preventDefault(); };  // Shift＋クリックで文字が選択されないように
+$('#score').onclick = e => {
+  if (!loaded) return;
+  const rect = $('#score').getBoundingClientRect(), x = e.clientX - rect.left, y = e.clientY - rect.top;
+  for (let i = 0; i < measures.length; i++) {
+    const r = measureBox(i);
+    if (!(r && x >= r.x && x < r.x + r.w && y >= r.y - 20 && y < r.y + r.h + 20)) continue;
+    if (e.shiftKey && i >= A()) $('#to').value = i + 1;
+    else {
+      $('#from').value = i + 1;
+      if (+$('#to').value < i + 1) $('#to').value = measures.length;
+    }
+    return stop();
+  }
+};
+
+let resizeTimer;
+addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { if (loaded) { stop(); layout(); cursorAt = 0; osmd.cursor.reset(); rangeChanged(); } }, 400);
+});
+
+route();
+</script>
+</body>
+</html>

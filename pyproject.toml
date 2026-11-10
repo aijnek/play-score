@@ -1,0 +1,7 @@
+[project]
+name = "play-score"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "homr>=0.7.0",
+]
