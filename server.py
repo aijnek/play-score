@@ -15,10 +15,13 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from PIL import Image, ImageOps
+
+from render import compare_images
 
 ROOT = Path(__file__).parent
 LIB = ROOT / "library"
@@ -71,12 +74,13 @@ def enqueue(song, *job):
 
 # ---------- 認識パイプライン ----------
 
-def claude(cwd, prompt):
+def claude(cwd, prompt, edit=True):
     """Claude Code をヘッドレス実行する。APIキーを外し、ログイン済みサブスクリプションで動かす。"""
+    tools = ["--tools", "Read,Edit", "--allowedTools", "Read(./**)", "Edit(./**)"] if edit else ["--tools", "Read", "--allowedTools", "Read(./**)"]
     env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     r = subprocess.run(
         # 読み書きは曲のフォルダ内だけに限定する。指示文や写真に悪意ある文が紛れても外のファイルに触れない。
-        ["claude", "-p", prompt, "--tools", "Read,Edit", "--allowedTools", "Read(./**)", "Edit(./**)"],
+        ["claude", "-p", prompt, *tools],
         cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1800,
     )
     if "Not logged in" in r.stdout + r.stderr:
@@ -114,16 +118,18 @@ Repeats and jumps decide the playback order, so encode every one that is printed
   <sound segno="segno"/> or <sound coda="coda"/> respectively.
 Ignore dynamics, fingering, slurs, pedal and layout.
 Be conservative: change only what you can clearly see in the images. Use Edit for targeted changes; do not
-rewrite or reformat the file, and keep it valid MusicXML.
-When done, reply with at most 5 short lines saying what you changed. The reader is a pianist who does not know
+rewrite or reformat the file, and keep it valid MusicXML."""
+
+REPLY = """When done, reply with at most 5 short lines saying what you changed. The reader is a pianist who does not know
 MusicXML: use musical terms only, never tag, attribute or file names. Refer to measures only by their `number`
 attribute, which is what the app shows; never use the measure numbers printed on the page, which may differ.
 If a value such as the tempo is your own guess, say so. 返事は必ず日本語で書くこと。"""
 
 
 def retime(measure):
-    """homr は付点などで右手と左手の長さがずれると、後ろの音を遅らせて小節をはみ出させることがある。
-    各段を単純に順に並べれば両手の長さが一致する場合に限り、その並びに組み直す。直したら True。"""
+    """小節を「右手を順に → 巻き戻し → 左手を順に」の形に組み直す。直したら True。
+    homr は両手の音を細かく行き来しながら書き出し、付点などで長さがずれると後ろの音を遅らせて小節を
+    はみ出させることがある。行き来が多いと描き直しも乱れる。各段を順に並べて両手の長さが一致する場合に限る。"""
     kids = list(measure)
     idx = [i for i, e in enumerate(kids) if e.tag in ("note", "backup", "forward")]
     if not idx:
@@ -131,27 +137,110 @@ def retime(measure):
     body = kids[idx[0]:idx[-1] + 1]
     if any(e.tag not in ("note", "backup") for e in body):
         return False  # 小節の途中に音部記号などがある場合は触らない
-    staves, pos, end = {}, 0, 0
+    staves = {}
     for e in body:
-        dur = int(e.findtext("duration") or 0)
-        if e.tag == "backup":
-            pos -= dur
-        else:
+        if e.tag == "note":
             staves.setdefault(e.findtext("staff"), []).append(e)
-            if e.find("chord") is None:
-                pos += dur
-                end = max(end, pos)
-    if len(staves) != 2:
+    if len(staves) != 2 or sum(e.tag == "backup" for e in body) < 2:
         return False
     sums = [sum(int(e.findtext("duration") or 0) for e in notes if e.find("chord") is None) for notes in staves.values()]
     voices = [{e.findtext("voice") for e in notes} for notes in staves.values()]
-    if sums[0] != sums[1] or end <= sums[0] or any(len(v) != 1 for v in voices):
+    if sums[0] != sums[1] or any(len(v) != 1 for v in voices):
         return False
     backup = ET.Element("backup")
     ET.SubElement(backup, "duration").text = str(sums[0])
     upper, lower = staves.values()
     measure[:] = kids[:idx[0]] + upper + [backup] + lower + kids[idx[-1] + 1:]
     return True
+
+
+CHECK = """You are checking machine-read piano sheet music. The image {image} shows one system twice: the top half is
+a PHOTO of the printed score (ground truth), the bottom half is the same measures RENDERED from the machine-read
+data, with measure numbers printed above each measure (the photo may print different numbers; ignore those).
+The layout differs (spacing, beams drawn as separate flags), so match the measures by order, left to right.
+Read the image, then go through it one measure at a time and one staff at a time. For every note, compare its
+vertical position on the staff (which line or space, how many ledger lines) between the two halves, then its
+accidental, then its note value and dots. Compare rests, ties, clef changes, key and time signatures, repeat
+signs and volta brackets too.
+Ignore differences that do not change what is played: beaming, stem direction, spacing, slurs, dynamics,
+pedal marks, fingering, tempo text, measure numbers, courtesy accidentals, how or where rests are drawn as long as
+their total length is the same, a clef change drawn just before versus just after a barline.
+Do not guess: report only differences you can actually see.
+Finish with a line containing only RESULT: followed by a JSON array, one object per difference:
+{{"measure": <number shown in the RENDERED half>, "hand": "right"|"left", "issue": "<what the photo shows vs what is rendered>"}}
+Use [] if the two halves agree everywhere."""
+
+
+def result(reply):
+    """返事の最後にある「RESULT: <JSON>」を取り出す。"""
+    tail = reply[reply.rfind("RESULT:") + 7:]
+    return json.loads(tail[min(i for i in (tail.find("["), tail.find("{")) if i >= 0):max(tail.rfind("]"), tail.rfind("}")) + 1])
+
+
+def verify_page(song, n):
+    """データを描き直して写真と見比べ、食い違いを直す。直した段はもう一度見比べる (直すのは3回まで)。
+    直しても見比べで合わなかった小節は、直す前に戻す (直しのほうが間違っていることがあるため)。
+    確かめきれなかった小節を {小節番号: 理由} で返す。"""
+    d = LIB / song
+    page = d / f"p{n}.musicxml"
+    todo, flags, before = None, {}, None
+    for attempt in (1, 2, 3, 4):
+        update_meta(song, step={"phase": "verify", "page": n, "round": attempt})
+        systems = compare_images(d, n)
+        if not systems:
+            raise RuntimeError("段の数が写真と合わないため、描き直しての見比べはできませんでした")
+        if todo is not None:
+            systems = [s for s in systems if s[1] & todo]
+
+        def check(system):  # 1段につき1つの Claude。まとめて見せるより見落としが少ない
+            found = result(claude(d, CHECK.format(image=f"p{n}_c{system[0]}.png"), edit=False))
+            return [{**f, "system": system[0]} for f in found if str(f.get("measure")) in system[1]]
+        with ThreadPoolExecutor(6) as pool:
+            found = [f for fs in pool.map(check, systems) for f in fs]
+        still = {str(f["measure"]) for f in found} & (todo or set())
+        if still:  # 直したはずの小節がまだ違うと言われた: その直しは信用せず、直す前の状態に戻す
+            old = {m.get("number"): m for m in ET.fromstring(before).iter("measure")}
+            tree = ET.parse(page)
+            for part in tree.getroot().findall("part"):
+                for i, m in enumerate(list(part)):
+                    if m.get("number") in still and m.get("number") in old:
+                        part[i] = old[m.get("number")]
+            tree.write(page, encoding="UTF-8", xml_declaration=True)
+            flags |= {m: "直しを試みましたが、見比べ直しても写真と合わなかったので、直す前に戻しました" for m in still}
+            update_meta(song, log={"kind": "proof", "page": n, "text": "見比べ直して合わなかった直しを取り消しました: 第"
+                                   + "・".join(sorted(still, key=int)) + "小節"})
+            found = [f for f in found if str(f["measure"]) not in still]
+        if not found:
+            return flags
+        if attempt == 4:  # 直す回数を使い切った
+            return flags | {str(f["measure"]): "見比べで違いが残りましたが、直しきれませんでした" for f in found}
+
+        before = page.read_bytes()
+        reply = result(claude_edit(d, d / f"p{n}.musicxml", f"""A checker compared an engraving of p{n}.musicxml with the
+photographed score, one system at a time, and reported these possible differences. It only saw pictures and is
+sometimes wrong, especially about exact pitches:
+{json.dumps(found, ensure_ascii=False)}
+Files: p{n}.musicxml (the data; measure numbers are the `number` attributes), p{n}_sK.jpg (zoomed photo of system K),
+p{n}_cK.png (photo above, engraving of the current data below).
+For each reported difference: read that measure in p{n}.musicxml to see what the data really contains, look at
+the photo, and decide. Edit only where the photo clearly shows something different from the data. If the data
+already matches the photo, do nothing. If you cannot tell from the photo, do not edit and list it as unsure.
+List as unsure only differences from the report above, never suspicions of your own. The measure numbers printed
+in the photo often differ from the data's (print does not count a pickup measure); that is not a difference.
+{RULES}
+Finish with a line containing only RESULT: followed by a JSON object like
+{{"fixed": [{{"measure": 12, "what": "..."}}], "unsure": [{{"measure": 30, "why": "..."}}]}}
+Write "what" and "why" in Japanese for a pianist who does not know MusicXML: musical terms only."""))
+        fixed, unsure = reply.get("fixed", []), reply.get("unsure", [])
+        with open(d / f"p{n}_verify.jsonl", "a") as f:  # 何が指摘され、どう判断したかの記録
+            f.write(json.dumps({"found": found, "fixed": fixed, "unsure": unsure}, ensure_ascii=False) + "\n")
+        if fixed:
+            update_meta(song, log={"kind": "proof", "page": n, "text": "描き直して写真と見比べ、直しました。\n"
+                                   + "\n".join(f"- 第{f['measure']}小節: {f['what']}" for f in fixed)})
+        todo = {str(f["measure"]) for f in fixed}
+        flags |= {str(u["measure"]): u["why"] for u in unsure}
+        if not todo:
+            return flags
 
 
 def process_page(song, n):
@@ -191,9 +280,12 @@ def process_page(song, n):
 Read the images first, then the MusicXML, compare them measure by measure, and correct recognition errors
 directly in p{n}.musicxml.
 If a metronome mark or tempo word is printed, make sure the first measure has <direction><sound tempo="BPM"/></direction>.
-{RULES}""")
+{RULES}
+{REPLY}""")
         update_meta(song, log={"kind": "proof", "page": n, "text": summary})
-    except Exception as e:  # Claude が使えなくても OMR の結果だけで先へ進む
+        flags = verify_page(song, n)
+        update_meta(song, flags={**read_meta(song).get("flags", {}), **flags})
+    except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
         update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
 
     # 曲全体の score.musicxml の末尾にこのページの小節を足し、小節番号を 1..N に振り直す
@@ -222,7 +314,8 @@ The user, who is looking at the printed score, asks for this correction:
 {instruction}
 
 Check the relevant images, then apply the correction directly in score.musicxml.
-{RULES}""")
+{RULES}
+{REPLY}""")
     update_meta(song, log={"kind": "fix", "ask": instruction, "text": summary})
 
 

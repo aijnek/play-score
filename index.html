@@ -73,6 +73,10 @@
   #score { position:relative; overflow:hidden; cursor:pointer; min-height:160px; user-select:none; -webkit-user-select:none; }
   #score .lit path { fill:var(--shu); stroke:var(--shu); }
   .sel { position:absolute; background:#d7402b18; border-left:2px solid var(--shu); pointer-events:none; mix-blend-mode:multiply; }
+  .flag { position:absolute; height:3px; background:repeating-linear-gradient(90deg, var(--shu) 0 5px, transparent 5px 9px); pointer-events:none; }
+  #flags { list-style:none; padding:0; margin:8px 0 0; font-size:13.5px; }
+  #flags li { margin-bottom:10px; }
+  #flags button { border:none; background:none; padding:0; color:var(--shu-deep); text-decoration:underline; text-underline-offset:3px; }
   .hint { margin-top:12px; }
   #waiting { position:relative; overflow:hidden; max-width:560px; margin:0 auto; }
   #waiting img { width:100%; display:block; }
@@ -184,6 +188,11 @@
         <input type="text" id="instruction" placeholder="12小節目の右手、最初のファはシャープ" aria-label="直してほしいところ" maxlength="1000">
         <button class="btn">直す</button>
       </form>
+      <div id="flagBox" hidden>
+        <h3>確かめきれなかった小節</h3>
+        <p class="sub">写真と見比べても判断がつかなかったところです。楽譜では点線で示しています。</p>
+        <ul id="flags"></ul>
+      </div>
       <h3>写真</h3>
       <div id="pages"></div>
       <button id="del">この曲を削除</button>
@@ -360,7 +369,8 @@ async function poll() {
 }
 
 const stepText = s => !s ? '順番を待っています' : s.phase === 'omr' ? `${s.page}ページ目を読み取っています`
-  : s.phase === 'proof' ? `${s.page}ページ目を写真と照合しています` : '直しています';
+  : s.phase === 'proof' ? `${s.page}ページ目を写真と照合しています`
+  : s.phase === 'verify' ? `${s.page}ページ目を描き直して、写真と見比べています` + (s.round > 1 ? `（${s.round}回目）` : '') : '直しています';
 const plain = t => t.replace(/[`*]/g, '');  // Claude の返事に混ざるMarkdown記号を落とす
 
 function render() {
@@ -384,6 +394,13 @@ function render() {
     return el('li', { className: 'error' }, e.text);
   }));
   if (!song.log.length) $('#thread').append(el('li', { className: 'sub' }, '写真と違って聞こえたら、下に書いてください。'));
+  const flagged = Object.entries(song.flags || {}).sort((a, b) => a[0] - b[0]);
+  $('#flagBox').hidden = !flagged.length;
+  $('#flags').replaceChildren(...flagged.map(([m, why]) => {
+    const go = el('button', {}, `第${m}小節`);
+    go.onclick = () => { $('#from').value = m; if (+$('#to').value < m) $('#to').value = measures.length; stop(); };
+    return el('li', {}, go, '　' + why);
+  }));
   const add = el('label', { className: 'tile', ariaLabel: 'ページを足す' }, '＋', el('input', { type: 'file', accept: 'image/*,.heic,.heif,application/pdf', multiple: true }));
   add.firstElementChild.onchange = e => take(e.target.files);
   $('#pages').replaceChildren(...Array.from({ length: song.pages }, (_, i) =>
@@ -646,7 +663,14 @@ function rangeChanged() {
   buildEvents();
   const first = events.find(e => e.step != null);
   moveCursor(first ? first.step : 0);
-  document.querySelectorAll('.sel').forEach(s => s.remove());
+  document.querySelectorAll('.sel, .flag').forEach(s => s.remove());
+  for (const m of Object.keys(song?.flags || {})) {  // 確かめきれなかった小節の下に点線
+    const r = measureBox(m - 1);
+    if (!r) continue;
+    const mark = el('div', { className: 'flag' });
+    Object.assign(mark.style, { left: r.x + 'px', top: r.y + r.h + 10 + 'px', width: r.w + 'px' });
+    $('#score').append(mark);
+  }
   const whole = A() === 0 && B() === measures.length - 1;
   $('#all').hidden = whole;
   if (whole) return;
