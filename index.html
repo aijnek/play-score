@@ -372,6 +372,7 @@ const stepText = s => !s ? '順番を待っています'
   : s.wait ? `Claude の利用上限に達しました。${new Date(s.wait * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}ごろ続きから再開します`
   : s.phase === 'omr' ? `${s.page}ページ目を読み取っています`
   : s.phase === 'proof' ? `${s.page}ページ目を写真と照合しています`
+  : s.phase === 'beam' ? `${s.page}ページ目の連桁を写真から読んでいます`
   : s.phase === 'verify' ? `${s.page}ページ目を描き直して、写真と見比べています` + (s.round > 1 ? `（${s.round}回目）` : '') : '直しています';
 const plain = t => t.replace(/[`*]/g, '');  // Claude の返事に混ざるMarkdown記号を落とす
 

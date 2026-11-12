@@ -390,6 +390,108 @@ def cut_systems(d, n):
     return len(systems)
 
 
+LEVELS = {"eighth": 1, "16th": 2, "32nd": 3, "64th": 4}
+
+BEAMS = """The image {image} is a photo of one system of a printed piano score. homr, the OMR program that read it,
+does not record beams, so we need to know which notes are joined by beams in the photo.
+Below are the notes of this system as the data has them, measure by measure and hand by hand, in order. Notes
+that could carry a beam (eighth or shorter) are numbered; the rest are in parentheses only to help you line up.
+The measure numbers are the data's own and may differ from those printed in the photo; match measures by order.
+{listing}
+Read the image, then for each measure and hand say which numbered notes are joined by one beam in the photo.
+A group is a list of consecutive numbers, at least two. Leave out notes drawn with their own flag.
+If a measure or hand in the photo does not have the same notes as listed, leave that measure or hand out.
+Finish with a line containing only RESULT: followed by a JSON object like
+{{"12": {{"right": [[1, 2, 3, 4], [5, 6]], "left": [[1, 2]]}}}}
+Use exactly the hand labels shown in the listing."""
+
+
+def beam_units(measure):
+    """小節の中の連桁を付けうる音 (8分音符以下。和音は1つ) を {手の名前: [音]}、確認用の一覧を [行] で返す。"""
+    voices, chord, head = {}, {}, None  # chord: 和音の頭 → 構成音の名前
+    for e in measure.findall("note"):
+        if e.find("chord") is None:
+            head = e
+            if e.find("grace") is None:
+                voices.setdefault((e.findtext("staff") or "1", e.findtext("voice") or "1"), []).append(e)
+        if e.find("pitch") is not None:
+            alter = {1: "#", -1: "b", 2: "##", -2: "bb"}.get(int(float(e.findtext("pitch/alter") or 0)), "")
+            chord.setdefault(id(head), []).append(e.findtext("pitch/step") + alter + e.findtext("pitch/octave"))
+    units, lines = {}, []
+    for staff in sorted({s for s, _ in voices}):
+        keys = [k for k in voices if k[0] == staff]
+        for key in keys:
+            hand = {"1": "right", "2": "left"}.get(staff, f"staff{staff}") + (f"-{key[1]}" if len(keys) > 1 else "")
+            notes, words = [], []
+            for e in voices[key]:
+                kind = (e.findtext("type") or "?") + "." * len(e.findall("dot"))
+                what = "rest" if e.find("rest") is not None else "+".join(chord.get(id(e), []))
+                if e.find("rest") is None and e.findtext("type") in LEVELS:
+                    notes.append(e)
+                    words.append(f"{len(notes)}:{what} {kind}")
+                else:
+                    words.append(f"({what} {kind})")
+            if len(notes) >= 2:
+                units[hand] = notes
+                lines.append(f"measure {measure.get('number')} {hand}: " + "  ".join(words))
+    return units, lines
+
+
+def set_beams(notes):
+    """連桁でつながる音の並びに <beam> を付ける。2本目以降は音価から決める。"""
+    # defer: 16分音符の2本目の途切れ (8つを4+4で区切るなど) は写真から読まず、つながる限り続ける。読み違いが目立ったら Claude に区切りも聞く
+    levels = [LEVELS[e.findtext("type")] for e in notes]
+    for i, e in enumerate(notes):
+        for b in range(1, levels[i] + 1):
+            before = i > 0 and levels[i - 1] >= b
+            after = i < len(notes) - 1 and levels[i + 1] >= b
+            kind = ("continue" if after else "end") if before else "begin" if after else "backward hook" if i else "forward hook"
+            beam = ET.Element("beam", number=str(b))
+            beam.text = kind
+            kids = list(e)
+            at = next((kids.index(c) for c in kids if c.tag in ("notations", "lyric", "play", "listen")), len(kids))
+            e.insert(at, beam)
+
+
+def add_beams(d, n, measures):
+    """写真の段ごとに Claude に連桁を読ませ、measures (ページ n の小節) に <beam> を付ける。付けた連桁の数を返す。
+    データの音と写真が合わない小節や、読めなかった段は旗のまま残す。"""
+    starts = [i for i, m in enumerate(measures) if i == 0 or m.find("print[@new-system='yes']") is not None]
+    if len(starts) != len(list(d.glob(f"p{n}_s*.jpg"))):
+        return 0  # 段と写真の対応が取れない
+    systems = [measures[a:b] for a, b in zip(starts, starts[1:] + [len(measures)])]
+
+    def read(k):
+        listing = [line for m in systems[k] for line in beam_units(m)[1]]
+        if not listing:
+            return {}
+        try:
+            return result(claude(d, BEAMS.format(image=f"p{n}_s{k + 1}.jpg", listing="\n".join(listing)), edit=False))
+        except Exception:
+            return {}  # この段は旗のまま
+    with ThreadPoolExecutor(6) as pool:
+        found = list(pool.map(read, range(len(systems))))
+    count = 0
+    for system, groups in zip(systems, found):
+        for m in system:
+            for e in m.iter("note"):
+                for b in e.findall("beam"):
+                    e.remove(b)
+            units, _ = beam_units(m)
+            hands = groups.get(m.get("number")) if isinstance(groups, dict) else None
+            for hand, notes in units.items():
+                used = set()
+                for g in (hands or {}).get(hand) or []:
+                    # 番号は1から連続して並び、他の連桁と重ならないものだけ使う
+                    if (isinstance(g, list) and len(g) >= 2 and all(isinstance(i, int) for i in g)
+                            and g == list(range(g[0], g[0] + len(g))) and 1 <= g[0] and g[-1] <= len(notes)
+                            and not used & set(g)):
+                        used |= set(g)
+                        set_beams(notes[g[0] - 1:g[-1]])
+                        count += 1
+    return count
+
+
 def proof_page(song, n):
     """p{n}.musicxml を写真と照合して直し、描き直して見比べる。Claude が使えなくても例外は出さない。"""
     d = LIB / song
@@ -410,6 +512,11 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
         update_meta(song, flags={**read_meta(song).get("flags", {}), **flags})
     except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
         update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
+    # 連桁は音が確定してから読む。校正で音が変わると番号がずれるため
+    update_meta(song, step={"phase": "beam", "page": n})
+    tree = ET.parse(page)
+    add_beams(d, n, tree.getroot().find("part").findall("measure"))
+    tree.write(page, encoding="UTF-8", xml_declaration=True)
 
 
 def process_page(song, n):
