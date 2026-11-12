@@ -538,6 +538,14 @@ function parseFlags(xml) {
   const syms = flags.filter(f => f.codaSym && !f.coda && !f.tocoda);
   if (syms.length && !flags.some(f => f.coda)) syms.pop().coda = true;
   if (syms.length && !flags.some(f => f.tocoda)) syms[0].tocoda = true;
+  // 1つの括弧が段やページで途切れて書かれていると、繰り返し記号の前に同じ番号の括弧が2度現れる。間の小節も同じ括弧に入れる
+  for (let i = 0, prev = -1; i < flags.length; i++) {
+    const f = flags[i];
+    if (!f.endings) { if (f.back || f.fwd) prev = -1; continue; }
+    if (prev >= 0 && i > prev + 1 && !flags[prev].back && String(flags[prev].endings) === String(f.endings))
+      for (let k = prev + 1; k < i; k++) flags[k].endings = f.endings;
+    prev = i;
+  }
   // 連続する括弧 (1. 2. …) をひとまとまりにして、最後の括弧と繰り返し回数を決める
   for (let i = 0; i < flags.length; i++) {
     if (!flags[i].endings || (i && flags[i - 1].endings)) continue;
