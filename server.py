@@ -17,7 +17,9 @@ import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageOps
 
@@ -74,19 +76,52 @@ def enqueue(song, *job):
 
 # ---------- 認識パイプライン ----------
 
+def limit_reset(text):
+    """「You've hit your 5-hour limit · resets 1:20pm (Asia/Tokyo)」から解除時刻を読む。読めなければ None。"""
+    m = re.search(r"hit your .*limit.*resets (?:([A-Z][a-z]{2}) (\d{1,2}),? (?:at )?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)(?: \(([\w/+-]+)\))?", text)
+    if not m:
+        return None
+    mon, day, hour, minute, ampm, tz = m.groups()
+    try:
+        tz = ZoneInfo(tz) if tz else None
+    except Exception:
+        tz = None
+    now = datetime.now(tz)
+    at = now.replace(hour=int(hour) % 12 + (12 if ampm == "pm" else 0), minute=int(minute or 0), second=0, microsecond=0)
+    if mon:
+        at = at.replace(month=datetime.strptime(mon, "%b").month, day=int(day))
+        if at < now - timedelta(days=1):
+            at = at.replace(year=at.year + 1)
+    elif at <= now:
+        at += timedelta(days=1)
+    return at.timestamp()
+
+
 def claude(cwd, prompt, edit=True):
-    """Claude Code をヘッドレス実行する。APIキーを外し、ログイン済みサブスクリプションで動かす。"""
+    """Claude Code をヘッドレス実行する。APIキーを外し、ログイン済みサブスクリプションで動かす。
+    利用上限に達したら、解除時刻まで待って同じ呼び出しをやり直す。"""
     tools = ["--tools", "Read,Edit", "--allowedTools", "Read(./**)", "Edit(./**)"] if edit else ["--tools", "Read", "--allowedTools", "Read(./**)"]
     env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
-    r = subprocess.run(
-        # 読み書きは曲のフォルダ内だけに限定する。指示文や写真に悪意ある文が紛れても外のファイルに触れない。
-        ["claude", "-p", prompt, *tools],
-        cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1800,
-    )
-    if "Not logged in" in r.stdout + r.stderr:
-        raise RuntimeError("Claude Code にログインしていません。ターミナルで claude を起動して /login を実行してください")
+    while True:
+        r = subprocess.run(
+            # 読み書きは曲のフォルダ内だけに限定する。指示文や写真に悪意ある文が紛れても外のファイルに触れない。
+            ["claude", "-p", prompt, *tools],
+            cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1800,
+        )
+        out = r.stdout + r.stderr
+        if "Not logged in" in out:
+            raise RuntimeError("Claude Code にログインしていません。ターミナルで claude を起動して /login を実行してください")
+        reset = limit_reset(out) if r.returncode else None
+        if not reset:
+            break
+        until = reset + 120  # 解除直後は混むので少し余裕を置く
+        # 並列の呼び出しが同時に待つことがあるので、他の呼び出しが付けた wait は引き継がない
+        step = {k: v for k, v in (read_meta(cwd.name).get("step") or {}).items() if k != "wait"} or None
+        update_meta(cwd.name, step={**(step or {}), "wait": until})
+        time.sleep(max(0, until - time.time()))
+        update_meta(cwd.name, step=step)
     if r.returncode:
-        raise RuntimeError((r.stdout + r.stderr).strip()[-300:] or "claude が失敗しました")
+        raise RuntimeError(out.strip()[-300:] or "claude が失敗しました")
     return r.stdout.strip()
 
 
@@ -243,6 +278,28 @@ Write "what" and "why" in Japanese for a pianist who does not know MusicXML: mus
             return flags
 
 
+def proof_page(song, n):
+    """p{n}.musicxml を写真と照合して直し、描き直して見比べる。Claude が使えなくても例外は出さない。"""
+    d = LIB / song
+    page = d / f"p{n}.musicxml"
+    strips = [f"p{n}_s{k}.jpg" for k in range(1, len((d / f"p{n}.txt").read_text().splitlines()) + 1)]
+    update_meta(song, step={"phase": "proof", "page": n})
+    try:
+        summary = claude_edit(d, page, f"""You are proofreading optical music recognition (OMR) output for a piano score.
+- p{n}.jpg is the photographed page. {", ".join(strips)} are zoomed crops of each system, top to bottom.
+- p{n}.musicxml is the OMR result for this page. A <print new-system="yes"/> marks the first measure of each new system.
+Read the images first, then the MusicXML, compare them measure by measure, and correct recognition errors
+directly in p{n}.musicxml.
+If a metronome mark or tempo word is printed, make sure the first measure has <direction><sound tempo="BPM"/></direction>.
+{RULES}
+{REPLY}""")
+        update_meta(song, log={"kind": "proof", "page": n, "text": summary})
+        flags = verify_page(song, n)
+        update_meta(song, flags={**read_meta(song).get("flags", {}), **flags})
+    except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
+        update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
+
+
 def process_page(song, n):
     d = LIB / song
     update_meta(song, step={"phase": "omr", "page": n})
@@ -265,28 +322,11 @@ def process_page(song, n):
     # 段(大譜表)ごとの拡大画像を切り出す。ページ全体だと Claude には細部が小さすぎる。
     im = Image.open(d / f"p{n}.jpg")
     W, H = im.size
-    strips = []
     for k, line in enumerate((d / f"p{n}.txt").read_text().splitlines(), 1):
         _, _, cy, _, h = map(float, line.split())
-        name = f"p{n}_s{k}.jpg"
-        im.crop((0, int(max(0, cy - h) * H), W, int(min(1, cy + h) * H))).save(d / name)
-        strips.append(name)
+        im.crop((0, int(max(0, cy - h) * H), W, int(min(1, cy + h) * H))).save(d / f"p{n}_s{k}.jpg")
 
-    update_meta(song, step={"phase": "proof", "page": n})
-    try:
-        summary = claude_edit(d, page, f"""You are proofreading optical music recognition (OMR) output for a piano score.
-- p{n}.jpg is the photographed page. {", ".join(strips)} are zoomed crops of each system, top to bottom.
-- p{n}.musicxml is the OMR result for this page. A <print new-system="yes"/> marks the first measure of each new system.
-Read the images first, then the MusicXML, compare them measure by measure, and correct recognition errors
-directly in p{n}.musicxml.
-If a metronome mark or tempo word is printed, make sure the first measure has <direction><sound tempo="BPM"/></direction>.
-{RULES}
-{REPLY}""")
-        update_meta(song, log={"kind": "proof", "page": n, "text": summary})
-        flags = verify_page(song, n)
-        update_meta(song, flags={**read_meta(song).get("flags", {}), **flags})
-    except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
-        update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
+    proof_page(song, n)
 
     # 曲全体の score.musicxml の末尾にこのページの小節を足し、小節番号を 1..N に振り直す
     if score.exists():
@@ -295,6 +335,31 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
             part.extend(new_part.findall("measure"))
     else:
         tree = ET.parse(page)
+    for part in tree.getroot().findall("part"):
+        for i, m in enumerate(part.findall("measure"), 1):
+            m.set("number", str(i))
+    tree.write(score, encoding="UTF-8", xml_declaration=True)
+    update_meta(song, measures=len(tree.getroot().find("part").findall("measure")))
+
+
+def process_reproof(song, n):
+    """照合できなかったページをやり直し、score.musicxml のそのページの小節を差し替える。
+    校正欄でそのページに入れた直しは消える。"""
+    d = LIB / song
+    update_meta(song, queued=[q for q in read_meta(song).get("queued", []) if q != n])
+    first = sum(len(ET.parse(d / f"p{i}.musicxml").getroot().findall("part[1]/measure")) for i in range(1, n))
+    count = len(ET.parse(d / f"p{n}.musicxml").getroot().findall("part[1]/measure"))
+    flags = {m: why for m, why in read_meta(song).get("flags", {}).items() if not first < int(m) <= first + count}
+    update_meta(song, flags=flags)
+    proof_page(song, n)
+    score = d / "score.musicxml"
+    tree, new = ET.parse(score), ET.parse(d / f"p{n}.musicxml")
+    for part, new_part in zip(tree.getroot().findall("part"), new.getroot().findall("part")):
+        old = part.findall("measure")[first:first + count]
+        at = list(part).index(old[0])
+        for m in old:
+            part.remove(m)
+        part[at:at] = new_part.findall("measure")
     for part in tree.getroot().findall("part"):
         for i, m in enumerate(part.findall("measure"), 1):
             m.set("number", str(i))
@@ -323,7 +388,7 @@ def worker():
     while True:
         song, kind, arg = jobs.get()
         try:
-            (process_page if kind == "page" else process_fix)(song, arg)
+            {"page": process_page, "reproof": process_reproof, "fix": process_fix}[kind](song, arg)
         except Exception as e:
             if not (LIB / song / "meta.json").exists():
                 continue  # 処理中に曲が削除された
@@ -375,10 +440,10 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/":
             return self.reply(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
         # id は自前で発行した16進のみ受け付ける (パストラバーサル防止)
-        m = re.fullmatch(r"/api/songs(?:/([0-9a-f]{12})(?:/(pages|score|fix)(?:/(\d+))?)?)?", path)
+        m = re.fullmatch(r"/api/songs(?:/([0-9a-f]{12})(?:/(pages|score|fix)(?:/(\d+)(/proof)?)?)?)?", path)
         if not m:
             return self.reply(404, {"error": "not found"})
-        song, sub, page = m.groups()
+        song, sub, page, proof = m.groups()
         if song and not (LIB / song / "meta.json").exists():
             return self.reply(404, {"error": "曲が見つかりません"})
         d = LIB / song if song else None
@@ -401,7 +466,17 @@ class Handler(BaseHTTPRequestHandler):
         if sub == "score" and method == "GET":
             f = d / "score.musicxml"
             return self.reply(200, f.read_bytes(), "application/xml") if f.exists() else self.reply(404, {"error": "まだ楽譜がありません"})
-        if sub == "pages" and page and method == "GET":
+        if sub == "pages" and proof and method == "POST":
+            n = int(page)
+            if not (d / f"p{n}.musicxml").exists() or not (d / "score.musicxml").exists():
+                return self.reply(400, {"error": "このページはまだ読み取れていません"})
+            with lock:  # 順番待ちのページを画面に出すために記録する
+                meta = read_meta(song)
+                meta["queued"] = sorted(set(meta.get("queued", [])) | {n})
+                (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+            enqueue(song, "reproof", n)
+            return self.reply(200, read_meta(song))
+        if sub == "pages" and page and not proof and method == "GET":
             f = d / f"p{int(page)}.jpg"
             if not f.exists():
                 return self.reply(404, {"error": "ページがありません"})
@@ -445,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     LIB.mkdir(exist_ok=True)
     for p in LIB.glob("*/meta.json"):  # 前回の起動で中断された処理の表示を解除
-        update_meta(p.parent.name, pending=0, step=None)
+        update_meta(p.parent.name, pending=0, step=None, queued=[])
     threading.Thread(target=worker, daemon=True).start()
     print(f"play_score 起動中: http://localhost:{PORT}  (このMac専用)")
     # 認証が無いので、このMacの外からは繋がせない

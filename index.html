@@ -368,7 +368,9 @@ async function poll() {
   if (!song.pending && last && last.kind !== 'error') toast(last.kind === 'fix' ? '直しました' : '読み取りました');
 }
 
-const stepText = s => !s ? '順番を待っています' : s.phase === 'omr' ? `${s.page}ページ目を読み取っています`
+const stepText = s => !s ? '順番を待っています'
+  : s.wait ? `Claude の利用上限に達しました。${new Date(s.wait * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}ごろ続きから再開します`
+  : s.phase === 'omr' ? `${s.page}ページ目を読み取っています`
   : s.phase === 'proof' ? `${s.page}ページ目を写真と照合しています`
   : s.phase === 'verify' ? `${s.page}ページ目を描き直して、写真と見比べています` + (s.round > 1 ? `（${s.round}回目）` : '') : '直しています';
 const plain = t => t.replace(/[`*]/g, '');  // Claude の返事に混ざるMarkdown記号を落とす
@@ -389,7 +391,13 @@ function render() {
   $('#thread').replaceChildren(...song.log.map(e => {
     const tag = e.page && el('span', { className: 'tag' }, e.page + 'ページ目');
     if (e.kind === 'proof') return el('li', { className: 'proof' }, tag, plain(e.text));
-    if (e.kind === 'skip') return el('li', { className: 'sub' }, tag, '写真との照合はできませんでした。読み取ったままの楽譜です。\n' + e.text);
+    if (e.kind === 'skip') {
+      const busy = song.pending && song.step?.page === e.page, queued = (song.queued || []).includes(e.page);
+      const redo = el('button', { className: 'btn', disabled: busy || queued },
+        busy ? 'このページを照合し直しています…' : queued ? '照合し直す順番を待っています' : 'このページを照合し直す');
+      redo.onclick = () => reproof(e.page);
+      return el('li', { className: 'sub' }, tag, '写真との照合はできませんでした。読み取ったままの楽譜です。\n' + e.text + '\n', redo);
+    }
     if (e.kind === 'fix') return el('li', { className: 'fix' }, el('p', { className: 'ask' }, e.ask), el('p', { className: 'ans' }, plain(e.text)));
     return el('li', { className: 'error' }, e.text);
   }));
@@ -442,6 +450,12 @@ $('#fix').onsubmit = async e => {
     $('#instruction').value = ''; render();
   } catch (err) { alert(err.message); }
 };
+
+async function reproof(n) {
+  if (!confirm(`${n}ページ目を写真と照合し直します。このページに校正欄で入れた直しは消えます。`)) return;
+  try { song = await (await api(`/${song.id}/pages/${n}/proof`, { method: 'POST' })).json(); render(); }
+  catch (err) { alert(err.message); }
+}
 
 // 読み取りや修正が終わったら、朱の丸をひとつ
 function toast(text) {
