@@ -189,6 +189,63 @@ def retime(measure):
     return True
 
 
+def slurs_to_ties(part):
+    """homr はタイを「同じ高さの音を結ぶスラー」として、しかも和音の1音にだけ書き出すので、再生で弾き直してしまう。
+    ある音が終わった瞬間に始まる同じ高さの音へのスラーをタイに置き換え、2つの和音の共通音をすべてタイでつなぐ。"""
+    # defer: 和音の共通音は全部つなぐ (一部だけタイで残りは弾き直す譜面は誤る)。そういう曲が出たら弧の上下位置で選ぶ
+    notes, t0 = [], 0  # (staff, 開始位置, 長さ, note)
+    for m in part.findall("measure"):
+        pos = end = last = 0
+        for e in m:
+            d = int(e.findtext("duration") or 0)
+            if e.tag == "backup":
+                pos -= d
+            elif e.tag == "forward":
+                pos += d
+            elif e.tag == "note":
+                if e.find("chord") is None:
+                    last, pos = pos, pos + d
+                if e.find("pitch") is not None:
+                    notes.append((e.findtext("staff"), t0 + last, d, e))
+            end = max(end, pos)
+        t0 += end
+    at = {}
+    for staff, t, _, e in notes:
+        at.setdefault((staff, t), []).append(e)
+    pitch = lambda e: (e.findtext("pitch/step"), e.findtext("pitch/octave"))
+    order = sorted(range(len(notes)), key=lambda i: notes[i][1])
+    open_ = {}
+    for i in order:
+        staff, t, d, e = notes[i]
+        for s in e.findall("notations/slur"):
+            key = (staff, s.get("number", "1"))
+            if s.get("type") == "start":
+                open_[key] = (t, d, e, s)
+            elif s.get("type") == "stop" and key in open_:
+                t1, d1, e1, s1 = open_.pop(key)
+                if t1 + d1 != t or pitch(e1) != pitch(e):
+                    continue  # 本物のスラー
+                e1.find("notations").remove(s1)
+                e.find("notations").remove(s)
+                for a in at[(staff, t1)]:
+                    for b in at[(staff, t)]:
+                        if pitch(a) == pitch(b):
+                            add_tie(a, "start")
+                            add_tie(b, "stop")
+
+
+def add_tie(note, kind):
+    if note.find(f"tie[@type='{kind}']") is not None:
+        return
+    tie = ET.Element("tie", type=kind)
+    kids = list(note)
+    note.insert(kids.index(note.find("duration")) + 1, tie)
+    notations = note.find("notations")
+    if notations is None:
+        notations = ET.SubElement(note, "notations")
+    ET.SubElement(notations, "tied", type=kind)
+
+
 CHECK = """You are checking machine-read piano sheet music. The image {image} shows one system twice: the top half is
 a PHOTO of the printed score (ground truth), the bottom half is the same measures RENDERED from the machine-read
 data, with measure numbers printed above each measure (the photo may print different numbers; ignore those).
@@ -317,6 +374,7 @@ def process_page(song, n):
         for i, m in enumerate(part.findall("measure"), 1):
             retime(m)
             m.set("number", str(offset + i))
+        slurs_to_ties(part)
     tree.write(page, encoding="UTF-8", xml_declaration=True)
 
     # 段(大譜表)ごとの拡大画像を切り出す。ページ全体だと Claude には細部が小さすぎる。
