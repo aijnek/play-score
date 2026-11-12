@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np  # homr の依存として入っている
 from PIL import Image, ImageOps
 
 from render import compare_images
@@ -130,8 +131,19 @@ def claude_edit(d, target, prompt):
     backup = target.read_bytes()
     try:
         summary = claude(d, prompt)
-        if not ET.parse(target).getroot().findall("part/measure"):
+        tree = ET.parse(target)
+        if not tree.getroot().findall("part/measure"):
             raise RuntimeError("編集後のMusicXMLに小節がありません")
+        # Claude はタイを <tie> (音) だけ書いて <tied> (描画) を書かないことがある。描画と画面のタイは <tied> を見る
+        missing = [(n, t.get("type")) for n in tree.iter("note") for t in n.findall("tie")
+                   if n.find(f"notations/tied[@type='{t.get('type')}']") is None]
+        for n, kind in missing:
+            notations = n.find("notations")
+            if notations is None:
+                notations = ET.SubElement(n, "notations")
+            ET.SubElement(notations, "tied", type=kind)
+        if missing:
+            tree.write(target, encoding="UTF-8", xml_declaration=True)
         return summary
     except Exception:
         target.write_bytes(backup)
@@ -335,11 +347,54 @@ Write "what" and "why" in Japanese for a pianist who does not know MusicXML: mus
             return flags
 
 
+def cut_systems(d, n):
+    """段(大譜表)ごとの拡大画像 p{n}_s{k}.jpg を切り出し、段の数を返す。ページ全体だと Claude には細部が小さすぎる。
+    homr の五線の枠 (p{n}.txt) は崩れることがある: 段の途中で切れた段 (コーダなど) が別々の枠になったり、
+    大譜表の片方の五線だけが見つかったりする。上下に重なる枠は1つの段にまとめ、大譜表のページで1段だけの枠は、
+    写真で五線が見える側に大譜表の高さまで広げる。"""
+    im = Image.open(d / f"p{n}.jpg")
+    W, H = im.size
+    boxes = []  # (上端, 下端, 大譜表か, 左端, 右端) を写真の高さ・幅に対する比で
+    for line in (d / f"p{n}.txt").read_text().splitlines():
+        cls, cx, cy, w, h = map(float, line.split())
+        boxes.append([cy - h / 2, cy + h / 2, cls == 1, cx - w / 2, cx + w / 2])
+    grand = sorted(b[1] - b[0] for b in boxes if b[2])
+    if grand:
+        g = grand[len(grand) // 2]
+        dark = np.asarray(im.convert("L")) < 128
+
+        def lines(top, bottom, left, right):  # 帯の中で、枠の幅の半分以上が黒い行 (五線) の数
+            rows = dark[int(max(0, top) * H):int(min(1, bottom) * H), int(left * W):int(right * W)]
+            return int((rows.mean(axis=1) > 0.5).sum()) if rows.size else 0
+        for b in boxes:
+            if b[2]:
+                continue
+            s = b[1] - b[0]
+            up = lines(b[1] - g - s / 2, b[1] - g + s * 1.5, b[3], b[4])  # 相方の五線が上にあればこのあたり
+            down = lines(b[0] + g - s * 1.5, b[0] + g + s / 2, b[3], b[4])
+            if up > down:
+                b[0] = b[1] - g
+            elif down > up:
+                b[1] = b[0] + g
+    systems = []
+    for top, bottom, *_ in sorted(boxes):
+        if systems and top < systems[-1][1]:
+            systems[-1][1] = max(systems[-1][1], bottom)
+        else:
+            systems.append([top, bottom])
+    for old in d.glob(f"p{n}_s*.jpg"):  # 前回の切り出しが残ると、段の数を数え違える
+        old.unlink()
+    for k, (top, bottom) in enumerate(systems, 1):
+        h = bottom - top
+        im.crop((0, int(max(0, top - h / 2) * H), W, int(min(1, bottom + h / 2) * H))).save(d / f"p{n}_s{k}.jpg")
+    return len(systems)
+
+
 def proof_page(song, n):
     """p{n}.musicxml を写真と照合して直し、描き直して見比べる。Claude が使えなくても例外は出さない。"""
     d = LIB / song
     page = d / f"p{n}.musicxml"
-    strips = [f"p{n}_s{k}.jpg" for k in range(1, len((d / f"p{n}.txt").read_text().splitlines()) + 1)]
+    strips = [f"p{n}_s{k}.jpg" for k in range(1, cut_systems(d, n) + 1)]
     update_meta(song, step={"phase": "proof", "page": n})
     try:
         summary = claude_edit(d, page, f"""You are proofreading optical music recognition (OMR) output for a piano score.
@@ -376,13 +431,6 @@ def process_page(song, n):
             m.set("number", str(offset + i))
         slurs_to_ties(part)
     tree.write(page, encoding="UTF-8", xml_declaration=True)
-
-    # 段(大譜表)ごとの拡大画像を切り出す。ページ全体だと Claude には細部が小さすぎる。
-    im = Image.open(d / f"p{n}.jpg")
-    W, H = im.size
-    for k, line in enumerate((d / f"p{n}.txt").read_text().splitlines(), 1):
-        _, _, cy, _, h = map(float, line.split())
-        im.crop((0, int(max(0, cy - h) * H), W, int(min(1, cy + h) * H))).save(d / f"p{n}_s{k}.jpg")
 
     proof_page(song, n)
 
