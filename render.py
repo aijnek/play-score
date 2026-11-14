@@ -101,11 +101,90 @@ def tidy(measure):
     measure[:] = out + [c for _, c in clefs if id(c) not in done] + trail
 
 
+LEVELS = {"eighth": 1, "16th": 2, "32nd": 3, "64th": 4}
+
+
+def set_beams(notes):
+    """連桁でつながる音の並びに <beam> を付ける。2本目以降は音価から決める。"""
+    # defer: 16分音符の2本目の途切れ (8つを4+4で区切るなど) は写真から読まず、つながる限り続ける。読み違いが目立ったら Claude に区切りも聞く
+    levels = [LEVELS[e.findtext("type")] for e in notes]
+    for i, e in enumerate(notes):
+        for b in range(1, levels[i] + 1):
+            before = i > 0 and levels[i - 1] >= b
+            after = i < len(notes) - 1 and levels[i + 1] >= b
+            kind = ("continue" if after else "end") if before else "begin" if after else "backward hook" if i else "forward hook"
+            beam = ET.Element("beam", number=str(b))
+            beam.text = kind
+            kids = list(e)
+            at = next((kids.index(c) for c in kids if c.tag in ("notations", "lyric", "play", "listen")), len(kids))
+            e.insert(at, beam)
+
+
+def beat_beams(root):
+    """見比べ用に、連桁のない小節の8分音符以下を拍 (4分音符) ごとにつなぐ。保存するデータには付けない。
+    旗のままだと、写真の連桁の本数 (32分か64分か) と見比べにくい。つなぐ範囲は写真と違ってよく、本数だけ合えばよい。"""
+    div = 1
+    for m in root.iter("measure"):
+        div = int(m.findtext("attributes/divisions") or div)
+        if m.find("note/beam") is not None:
+            continue
+        pos, runs = 0, {}
+        for e in m:
+            dur = int(e.findtext("duration") or 0)
+            if e.tag == "backup":
+                pos -= dur
+            elif e.tag == "forward":
+                pos += dur
+            elif e.tag == "note" and e.find("chord") is None and e.find("grace") is None:
+                run = runs.setdefault((e.findtext("staff"), e.findtext("voice")), [[]])
+                if e.find("rest") is not None or e.findtext("type") not in LEVELS:
+                    run.append([])
+                else:
+                    if run[-1] and run[-1][-1][0] != pos // div:
+                        run.append([])
+                    run[-1].append((pos // div, e))
+                pos += dur
+        for run in runs.values():
+            for g in run:
+                if len(g) > 1:
+                    set_beams([e for _, e in g])
+
+
+def tuplet_marks(root):
+    """見比べ用に、連符の頭と終わりに <tuplet> を付ける (Verovio は <tuplet> がないと数字を描かない)。保存するデータには付けない。"""
+    # defer: 同じ声部で連符の割り方が同じ音を、actual-notes 個ずつ1組にする。4分+8分の3連符のように音価の混ざる連符は組が
+    # ずれて数字の位置が変わる。見比べがそれを食い違いと言い出したら、長さの合計で区切る
+    for m in root.iter("measure"):
+        if m.find("note/notations/tuplet") is not None:
+            continue
+        groups = {}
+        for e in m.findall("note"):
+            if e.find("chord") is not None or e.find("grace") is not None:
+                continue
+            tm = e.find("time-modification")
+            g = groups.setdefault((e.findtext("staff"), e.findtext("voice")), [[]])
+            ratio = tm is not None and (tm.findtext("actual-notes"), tm.findtext("normal-notes"))
+            if g[-1] and (g[-1][-1][0] != ratio or len(g[-1]) == int(ratio[0])):
+                g.append([])
+            if ratio:
+                g[-1].append((ratio, e))
+        for g in groups.values():
+            for run in g:
+                if len(run) > 1:
+                    for kind, (_, e) in (("start", run[0]), ("stop", run[-1])):
+                        notations = e.find("notations")
+                        if notations is None:
+                            notations = ET.SubElement(e, "notations")
+                        ET.SubElement(notations, "tuplet", type=kind, number="1")
+
+
 def compare_images(d, n):
     """ページ n の段ごとに p{n}_c{k}.png (上: 写真 / 下: 描き直し) を作り、[(k, {その段の小節番号})] を返す。
     段の数が写真と合わないときは対応が取れないので [] を返す。"""
     root = ET.parse(d / f"p{n}.musicxml").getroot()
     show_accidentals(root)
+    beat_beams(root)
+    tuplet_marks(root)
     for m in root.iter("measure"):
         tidy(m)
     xml = ET.tostring(root, encoding="unicode")

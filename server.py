@@ -4,6 +4,7 @@
 """
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -17,6 +18,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from fractions import Fraction
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,7 +27,7 @@ import numpy as np  # homr の依存として入っている
 from PIL import Image, ImageOps
 
 import measure
-from render import compare_images
+from render import LEVELS, compare_images, set_beams
 
 ROOT = Path(__file__).parent
 LIB = ROOT / "library"
@@ -140,6 +142,58 @@ def claude(cwd, prompt, edit=True):
     return r.stdout.strip()
 
 
+NOTE_DIV = {"whole": 1, "half": 2, "quarter": 4, "eighth": 8, "16th": 16, "32nd": 32, "64th": 64, "128th": 128}
+
+
+def exact_tuplets(root):
+    """連符の音と、いまの分解能では割り切れない音 (64分音符など) の長さを、音符の種類から書き直す。直したら True。
+    5連符や13連符は1拍の分解能 (<divisions>) で割り切れず、Claude に長さを計算させると不揃いになる。
+    分解能を割り切れるところまで上げ、長さが変わってずれる巻き戻し (<backup>) も合わせ直す。"""
+    changed = False
+    for part in root.findall("part"):
+        div, k, exact = 1, 1, {}  # exact: 音 → 正しい長さ (分解能を上げる前の単位の分数)
+        for m in part.findall("measure"):
+            div = int(m.findtext("attributes/divisions") or div)
+            for n in m.findall("note"):
+                tm, kind = n.find("time-modification"), n.findtext("type")
+                if kind not in NOTE_DIV or n.find("grace") is not None or n.find("duration") is None:
+                    continue
+                x = Fraction(4 * div, NOTE_DIV[kind]) * (2 - Fraction(1, 2 ** len(n.findall("dot"))))
+                if tm is not None and tm.find("normal-type") is None:
+                    x = x * int(tm.findtext("normal-notes")) / int(tm.findtext("actual-notes"))
+                elif tm is not None or x.denominator == 1:
+                    continue
+                exact[n], k = x, math.lcm(k, x.denominator)
+        if k > 1:
+            for e in part.iter():
+                if e.tag in ("divisions", "duration"):
+                    e.text = str(int(e.text) * k)
+        for m in part.findall("measure"):
+            old = new = 0  # 書かれていた長さでの位置と、正しい長さでの位置
+            seen = {0: 0}
+            for e in m:
+                dur = e.find("duration")
+                if dur is None or e.tag not in ("note", "backup", "forward"):
+                    continue
+                if e.tag == "note":
+                    was = int(dur.text)
+                    now = int(exact[e] * k) if e in exact else was
+                    if e.find("chord") is None and e.find("grace") is None:
+                        old, new = old + was, new + now
+                        seen.setdefault(old, new)
+                else:  # 巻き戻しと早送りは、書かれていた行き先と同じ音の位置へ行くようにする
+                    old += int(dur.text) * (-1 if e.tag == "backup" else 1)
+                    to = seen.get(old, old)
+                    was, now = int(dur.text) * (-1 if e.tag == "backup" else 1), to - new
+                    new = to
+                    if now != was:
+                        e.tag = "backup" if now < 0 else "forward"
+                    now, was = abs(now), abs(was)
+                if now != was:
+                    dur.text, changed = str(now), True
+    return changed
+
+
 def claude_edit(d, target, prompt):
     """target(MusicXML) を Claude に直接編集させる。壊れたXMLになったら元に戻す。"""
     backup = target.read_bytes()
@@ -156,7 +210,7 @@ def claude_edit(d, target, prompt):
             if notations is None:
                 notations = ET.SubElement(n, "notations")
             ET.SubElement(notations, "tied", type=kind)
-        if missing:
+        if exact_tuplets(tree.getroot()) or missing:
             tree.write(target, encoding="UTF-8", xml_declaration=True)
         return summary
     except Exception:
@@ -168,6 +222,14 @@ RULES = """Fix only what affects how the music sounds: key signature (<fifths>),
 wrong pitches/octaves, missing or spurious accidentals (an accidental carries through its measure, and
 <alter> must be present on every affected <note>), wrong durations (every voice of a measure must add up
 to the time signature, except pickup measures), missing or extra notes, ties.
+Tuplets (a 3, 5, 6, 13 ... printed over a group, or a run whose printed note values add up to more than the beats
+it fills): on every note and rest of the group keep <type> as printed and put
+<time-modification><actual-notes>N</actual-notes><normal-notes>M</normal-notes></time-modification> after <type>
+and <dot> (N notes played in the time of M of that type: triplet 3 and 2, quintuplet 5 and 4, thirteen 16ths
+filling two beats 13 and 8). Do not work out exact tuplet durations and do not change <divisions>: write the
+nearest whole number in <duration>. Software recomputes tuplet durations from <type> and <time-modification>.
+The same holds for a note too short for <divisions> (a 64th when <divisions> is 8): write the right <type> and the
+nearest whole number in <duration>.
 Repeats and jumps decide the playback order, so encode every one that is printed, exactly:
 - repeat barlines: <barline location="left"><repeat direction="forward"/></barline> and
   <barline location="right"><repeat direction="backward"/></barline>
@@ -275,7 +337,10 @@ def add_tie(note, kind):
 CHECK = """You are checking machine-read piano sheet music. The image {image} shows one system twice: the top half is
 a PHOTO of the printed score (ground truth), the bottom half is the same measures RENDERED from the machine-read
 data, with measure numbers printed above each measure (the photo may print different numbers; ignore those).
-The layout differs (spacing, beams drawn as separate flags), so match the measures by order, left to right.
+The layout differs (spacing, stems), so match the measures by order, left to right. The RENDERED half beams notes
+beat by beat mechanically, so which notes are joined may differ from the photo; that is not an error. But the number
+of beam lines (or flags) on each note is its note value: 1 = eighth, 2 = 16th, 3 = 32nd, 4 = 64th. Count them on
+both halves for every beamed note.
 Read the image, then go through it one measure at a time and one staff at a time. For every note, compare its
 vertical position on the staff (which line or space, how many ledger lines) between the two halves, then its
 accidental, then its note value and dots. Compare rests, ties, clef changes, key and time signatures, repeat
@@ -404,7 +469,6 @@ def cut_systems(d, n):
     return len(systems)
 
 
-LEVELS = {"eighth": 1, "16th": 2, "32nd": 3, "64th": 4}
 
 BEAMS = """The image {image} is a photo of one system of a printed piano score. homr, the OMR program that read it,
 does not record beams, so we need to know which notes are joined by beams in the photo.
@@ -449,22 +513,6 @@ def beam_units(measure):
                 units[hand] = notes
                 lines.append(f"measure {measure.get('number')} {hand}: " + "  ".join(words))
     return units, lines
-
-
-def set_beams(notes):
-    """連桁でつながる音の並びに <beam> を付ける。2本目以降は音価から決める。"""
-    # defer: 16分音符の2本目の途切れ (8つを4+4で区切るなど) は写真から読まず、つながる限り続ける。読み違いが目立ったら Claude に区切りも聞く
-    levels = [LEVELS[e.findtext("type")] for e in notes]
-    for i, e in enumerate(notes):
-        for b in range(1, levels[i] + 1):
-            before = i > 0 and levels[i - 1] >= b
-            after = i < len(notes) - 1 and levels[i + 1] >= b
-            kind = ("continue" if after else "end") if before else "begin" if after else "backward hook" if i else "forward hook"
-            beam = ET.Element("beam", number=str(b))
-            beam.text = kind
-            kids = list(e)
-            at = next((kids.index(c) for c in kids if c.tag in ("notations", "lyric", "play", "listen")), len(kids))
-            e.insert(at, beam)
 
 
 def add_beams(d, n, measures):
