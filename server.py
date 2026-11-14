@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 import numpy as np  # homr の依存として入っている
 from PIL import Image, ImageOps
 
+import measure
 from render import compare_images
 
 ROOT = Path(__file__).parent
@@ -31,8 +32,20 @@ LIB = ROOT / "library"
 # homr を子プロセスで動かすスクリプト。onnxruntime は既定で利用状況を Microsoft に送信し、その送信待ちで
 # 終了時に固まることがあるので、送信を切ったうえで、結果を書き終えたら後始末を待たずに終了する。
 HOMR = """
-import os, sys, traceback, onnxruntime
+import os, sys, json, traceback, onnxruntime
 onnxruntime.disable_telemetry_events()
+import homr.main
+detect = homr.main.detect_staffs_in_image
+def detect_and_dump(path, config):
+    res = detect(path, config)
+    try:  # 測った結果を残す。失敗しても homr の結果はそのまま使う
+        geo = [[{"notes": [[n.center[0], n.center[1]] for n in s.get_notes()], "grid": [[p.x, *p.y] for p in s.grid]}
+                for s in ms.staffs] for ms in res[0]]
+        json.dump(geo, open(os.path.splitext(path)[0] + "_geo.json", "w"))
+    except Exception:
+        traceback.print_exc()
+    return res
+homr.main.detect_staffs_in_image = detect_and_dump
 from homr.main import main
 try:
     main()
@@ -119,7 +132,8 @@ def claude(cwd, prompt, edit=True):
         # 並列の呼び出しが同時に待つことがあるので、他の呼び出しが付けた wait は引き継がない
         step = {k: v for k, v in (read_meta(cwd.name).get("step") or {}).items() if k != "wait"} or None
         update_meta(cwd.name, step={**(step or {}), "wait": until})
-        time.sleep(max(0, until - time.time()))
+        while time.time() < until:  # まとめて待つと、Mac がスリープした時間のぶん遅れる
+            time.sleep(30)
         update_meta(cwd.name, step=step)
     if r.returncode:
         raise RuntimeError(out.strip()[-300:] or "claude が失敗しました")
@@ -522,6 +536,7 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
 def process_page(song, n):
     d = LIB / song
     update_meta(song, step={"phase": "omr", "page": n})
+    (d / f"p{n}_geo.json").unlink(missing_ok=True)  # 前の測定が残っていると、別の写真の結果を使ってしまう
     r = subprocess.run([sys.executable, "-c", HOMR, "--write-staff-positions", f"p{n}.jpg"], cwd=d, capture_output=True, text=True)
     page = d / f"p{n}.musicxml"
     if not page.exists():
@@ -537,7 +552,14 @@ def process_page(song, n):
             retime(m)
             m.set("number", str(offset + i))
         slurs_to_ties(part)
+    try:  # 測定が使えなくても読み取りは進める
+        fixed = measure.fix_octaves(tree.getroot(), json.loads((d / f"p{n}_geo.json").read_text()))
+    except Exception:
+        fixed = []
     tree.write(page, encoding="UTF-8", xml_declaration=True)
+    if fixed:
+        where = "・".join(f"第{m}小節の{'右手' if st == 1 else '左手'}" for m, st in fixed)
+        update_meta(song, log={"kind": "proof", "page": n, "text": f"音符の位置を測り、{where}を1オクターブ直しました。"})
 
     proof_page(song, n)
 
