@@ -288,7 +288,7 @@ def slurs_to_ties(part):
             elif e.tag == "note":
                 if e.find("chord") is None:
                     last, pos = pos, pos + d
-                if e.find("pitch") is not None:
+                if e.find("pitch") is not None and e.find("grace") is None:  # 装飾音符はタイにしない
                     notes.append((e.findtext("staff"), t0 + last, d, e))
             end = max(end, pos)
         t0 += end
@@ -306,7 +306,8 @@ def slurs_to_ties(part):
                 open_[key] = (t, d, e, s)
             elif s.get("type") == "stop" and key in open_:
                 t1, d1, e1, s1 = open_.pop(key)
-                if t1 + d1 != t or pitch(e1) != pitch(e):
+                # 弧の終わりが2声部の和音の別の音に付いていることがある。終わりの和音に同じ高さの音があればタイとみなす
+                if t1 + d1 != t or pitch(e1) not in {pitch(b) for b in at[(staff, t)]}:
                     continue  # 本物のスラー
                 e1.find("notations").remove(s1)
                 e.find("notations").remove(s)
