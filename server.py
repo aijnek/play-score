@@ -18,6 +18,7 @@ import time
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from fractions import Fraction
@@ -609,6 +610,35 @@ def pick_page(song, n):
             for m in differ if choice.get(m) not in ("A", "B")}
 
 
+def keep_agreed(d, n, before):
+    """校正の前 (before: p{n}.musicxml の中身) に homr と Audiveris が一致していた小節の音を、校正が変えていたら元に戻す。
+    一致した小節はほぼ正しく (試験台で96%)、校正のほうが写真を読み違えて書き換えることがあるため。
+    本当に違っていれば、このあとの見比べで指摘されて直る。戻した小節の番号を返す。"""
+    agree = d / f"p{n}_agree.json"
+    if not agree.exists():
+        return []
+    agreed = set(json.loads(agree.read_text()))
+    old_root, tree = ET.fromstring(before), ET.parse(d / f"p{n}.musicxml")
+    old_m, new_m = old_root.find("part").findall("measure"), tree.getroot().find("part").findall("measure")
+    if len(old_m) != len(new_m):
+        return []
+    old_ev, new_ev = consensus.events(old_root), consensus.events(tree.getroot())
+    k = Fraction(int(next(tree.getroot().iter("divisions")).text), int(next(old_root.iter("divisions")).text))
+    kept = []
+    for i, (a, b) in enumerate(zip(old_m, new_m)):
+        if a.get("number") in agreed and Counter(old_ev[i]["ev"]) != Counter(new_ev[i]["ev"]):
+            for e in a.iter():  # 校正で分解能が上がっていれば (連符の長さの書き直し) 合わせる
+                if e.tag in ("divisions", "duration"):
+                    e.text = str(int(int(e.text) * k))
+            part = tree.getroot().find("part")
+            part[list(part).index(b)] = a
+            kept.append(a.get("number"))
+    if kept:
+        shutil.copy(d / f"p{n}.musicxml", d / f"p{n}_proofed.musicxml")  # 取り消す前の校正の結果 (確かめるための記録)
+        tree.write(d / f"p{n}.musicxml", encoding="UTF-8", xml_declaration=True)
+    return kept
+
+
 def proof_page(song, n):
     """p{n}.musicxml を写真と照合して直し、描き直して見比べる。Claude が使えなくても例外は出さない。"""
     d = LIB / song
@@ -621,6 +651,7 @@ def proof_page(song, n):
         update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
     update_meta(song, flags={**read_meta(song).get("flags", {}), **unsure})
     update_meta(song, step={"phase": "proof", "page": n})
+    before = page.read_bytes()
     try:
         summary = claude_edit(d, page, f"""You are proofreading optical music recognition (OMR) output for a piano score.
 - p{n}.jpg is the photographed page. {", ".join(strips)} are zoomed crops of each system, top to bottom.
@@ -631,6 +662,10 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
 {RULES}
 {REPLY}""")
         update_meta(song, log={"kind": "proof", "page": n, "text": summary})
+        kept = keep_agreed(d, n, before)
+        if kept:
+            update_meta(song, log={"kind": "proof", "page": n, "text": "2つの読み取りが一致していた第" + "・".join(kept)
+                                   + "小節は、校正での書き換えを取り消しました。"})
         flags = verify_page(song, n)
         update_meta(song, flags={**read_meta(song).get("flags", {}), **flags})
     except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
@@ -644,6 +679,7 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
 
 def second_opinion(d, n, root):
     """Audiveris でも読み、homr の結果 (root) と小節ごとに突き合わせる。root を書き換え、知らせる文を返す (なければ None)。"""
+    (d / f"p{n}_agree.json").unlink(missing_ok=True)
     if not Path(AUDIVERIS).exists():
         return None
     out = d / "audiveris"
@@ -656,6 +692,8 @@ def second_opinion(d, n, root):
         return None
     res = consensus.merge(root, aud)
     (d / f"p{n}_alt.musicxml").unlink(missing_ok=True)
+    measures = root.find("part").findall("measure")
+    (d / f"p{n}_agree.json").write_text(json.dumps([measures[i].get("number") for i in res["agree"]]))
     if res["alt"]:  # 食い違った小節を Audiveris の読みにしたページ。どちらを採るかは pick_page で決める
         alt = copy.deepcopy(root)
         measures = alt.find("part").findall("measure")
