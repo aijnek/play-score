@@ -8,7 +8,11 @@ import copy
 import sys
 from pathlib import Path
 
+import xml.etree.ElementTree as ET
+
 from music21 import corpus, layout, stream, clef, harmony
+
+import server
 
 TRUTH = Path(__file__).parent / "bench" / "truth"
 
@@ -83,6 +87,18 @@ def clean(score):
     return score
 
 
+def arcs_to_ties(f):
+    """ある音が終わった瞬間に始まる同じ高さの音へのスラーはタイにする。譜面ではタイと見分けがつかず、弾く人もタイとして弾く。
+    アプリが homr の出力に使うのと同じ処理 (server.slurs_to_ties)。描いた画像は変わらない。"""
+    tree = ET.parse(f)
+    before = ET.tostring(tree.getroot())
+    for part in tree.getroot().findall("part"):
+        server.slurs_to_ties(part)
+    if ET.tostring(tree.getroot()) != before:
+        tree.write(f, encoding="UTF-8", xml_declaration=True)
+        print("arcs to ties:", f.name)
+
+
 def main():
     TRUTH.mkdir(parents=True, exist_ok=True)
     jobs = {**{k: lambda v=v: piano(*v) for k, v in PIANO.items()}, **{k: lambda v=v: chorale(v) for k, v in CHORALES.items()}}
@@ -92,6 +108,8 @@ def main():
             continue
         clean(make()).write("musicxml", fp=f)
         print("wrote", f.name)
+    for f in sorted(TRUTH.glob("*.musicxml")):
+        arcs_to_ties(f)
 
 
 if __name__ == "__main__":
