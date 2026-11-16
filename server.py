@@ -106,7 +106,7 @@ def limit_reset(text):
 
 def claude(cwd, prompt, edit=True):
     """Claude Code をヘッドレス実行する。APIキーを外し、ログイン済みサブスクリプションで動かす。
-    利用上限に達したら、解除時刻まで待って同じ呼び出しをやり直す。"""
+    利用上限に達したら、解除されるまで (予定時刻か10分ごとに) 待って同じ呼び出しをやり直す。"""
     tools = ["--tools", "Read,Edit", "--allowedTools", "Read(./**)", "Edit(./**)"] if edit else ["--tools", "Read", "--allowedTools", "Read(./**)"]
     env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     while True:
@@ -121,7 +121,8 @@ def claude(cwd, prompt, edit=True):
         reset = limit_reset(out) if r.returncode else None
         if not reset:
             break
-        until = reset + 120  # 解除直後は混むので少し余裕を置く
+        # 解除直後は混むので少し余裕を置く。予定より早く解除されることもあるので、10分ごとに呼び直して確かめる
+        until = min(reset + 120, time.time() + 600)
         # 並列の呼び出しが同時に待つことがあるので、他の呼び出しが付けた wait は引き継がない
         step = {k: v for k, v in (read_meta(cwd.name).get("step") or {}).items() if k != "wait"} or None
         update_meta(cwd.name, step={**(step or {}), "wait": until})
