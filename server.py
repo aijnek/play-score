@@ -697,6 +697,52 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
     tree.write(page, encoding="UTF-8", xml_declaration=True)
 
 
+def spots(part):
+    """小節ごとに {(段, 位置): [(note, 長さ)]} を返す。位置と長さは4分音符を1とする分数。装飾音符と休符は除く。"""
+    out, div = [], 1
+    for m in part.findall("measure"):
+        at, pos, last = {}, 0, 0
+        for e in m:
+            if e.tag == "attributes":
+                div = int(e.findtext("divisions", div))
+            d = int(e.findtext("duration") or 0)
+            if e.tag == "backup":
+                pos -= d
+            elif e.tag == "forward":
+                pos += d
+            elif e.tag == "note" and e.find("grace") is None:
+                if e.find("chord") is None:
+                    last, pos = pos, pos + d
+                if e.find("pitch") is not None:
+                    at.setdefault((e.findtext("staff") or "1", Fraction(last, div)), []).append((e, Fraction(d, div)))
+        out.append(at)
+    return out
+
+
+def borrow_ties(homr, aud):
+    """Audiveris がタイでつないだ (同じ高さのスラーを含む) 2つの音と同じ位置に、homr も同じ高さの音を読んでいれば、
+    homr の音もタイでつなぐ。homr は弧を見落としやすい。Audiveris は音部記号を読み違えて高さを誤っても、弧の位置は合っている。"""
+    pitch = lambda e: (e.findtext("pitch/step"), e.findtext("pitch/octave"), float(e.findtext("pitch/alter") or 0))
+    H, A = spots(homr.find("part")), spots(aud.find("part"))
+    to_h = {j: i for i, j in consensus.align(consensus.events(homr), consensus.events(aud))}
+    for j, at in enumerate(A):
+        for (s, o), notes in at.items():
+            for e, d in notes:
+                if e.find("tie[@type='start']") is None:
+                    continue
+                j2, o2 = (j, o + d) if (s, o + d) in at else (j + 1, 0)  # 次の音が同じ小節になければ次の小節の頭
+                if j not in to_h or j2 not in to_h or to_h[j2] - to_h[j] != j2 - j:
+                    continue
+                if pitch(e) not in {pitch(b) for b, _ in A[j2].get((s, o2), [])}:
+                    continue
+                first = [a for a, da in H[to_h[j]].get((s, o), []) if j2 != j or o + da == o2]
+                second = [b for b, _ in H[to_h[j2]].get((s, o2), [])]
+                common = {pitch(a) for a in first} & {pitch(b) for b in second}
+                p = pitch(e) if pitch(e) in common else next(iter(common)) if len(common) == 1 else None
+                if p:  # 共通音が2つ以上で Audiveris の高さと合わないときは、どれをつなぐか決められないので触らない
+                    tie_chords([a for a in first if pitch(a) == p], [b for b in second if pitch(b) == p], pitch)
+
+
 def second_opinion(d, n, root):
     """Audiveris でも読み、homr の結果 (root) と小節ごとに突き合わせる。root を書き換え、知らせる文を返す (なければ None)。"""
     (d / f"p{n}_agree.json").unlink(missing_ok=True)
@@ -710,6 +756,9 @@ def second_opinion(d, n, root):
             aud = ET.fromstring(z.read(next(f for f in z.namelist() if not f.startswith("META-INF"))))
     except Exception:  # 読めなかったときは homr だけで進める
         return None
+    if aud.find("part") is not None:
+        slurs_to_ties(aud.find("part"))
+        borrow_ties(root, aud)
     res = consensus.merge(root, aud)
     (d / f"p{n}_alt.musicxml").unlink(missing_ok=True)
     measures = root.find("part").findall("measure")
