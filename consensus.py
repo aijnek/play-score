@@ -132,10 +132,11 @@ def transplant(dst, src):
 
 def merge(homr, aud):
     """homr のページ (root) を土台に、Audiveris (root) と小節ごとに突き合わせる。homr を書き換え、
-    {"agree": [小節の並び順], "replaced": [...], "disagree": [...]} を返す。
-    一致しない小節は、homr が拍子に合わず Audiveris が合うときだけ Audiveris の音に入れ替える。"""
+    {"agree": [小節の並び順], "replaced": [...], "disagree": [...], "alt": {並び順: Audiveris の小節}} を返す。
+    一致しない小節は、homr が拍子に合わず Audiveris が合うときだけ Audiveris の音に入れ替える。
+    それ以外の食い違いは alt に Audiveris の小節 (分解能はそろえ済み) を残し、どちらを採るかは後で決める。"""
     hp, ap = homr.find("part"), aud.find("part")
-    res = {"agree": [], "replaced": [], "disagree": []}
+    res = {"agree": [], "replaced": [], "disagree": [], "alt": {}}
     if hp is None or ap is None or not common_divisions(hp, ap):
         return res
     H, A = events(homr), events(aud)
@@ -149,4 +150,5 @@ def merge(homr, aud):
             res["replaced"].append(i)
         else:
             res["disagree"].append(i)
+            res["alt"][i] = am[j]
     return res

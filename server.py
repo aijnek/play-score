@@ -2,6 +2,7 @@
 
 起動: uv run server.py   (ブラウザで http://localhost:8765 。このMac専用)
 """
+import copy
 import io
 import json
 import math
@@ -546,11 +547,70 @@ def add_beams(d, n, measures):
     return count
 
 
+PICK = """The image {image} shows one system of a printed piano score three times: at the top the PHOTO of the printed page
+(ground truth), then two machine readings of it, A and B, rendered from data, with measure numbers printed above each
+measure (the photo may print different numbers; ignore those, match measures by order, left to right).
+A and B differ in measures {measures}. For each of those measures decide which rendering, A or B, matches the PHOTO in
+everything that changes what is played: pitches (staff position, ledger lines, accidentals, key signature), note
+values and dots, rests, ties, and which notes sound together. Ignore beaming, stem direction, spacing, slurs, dynamics,
+fingering and how rests are positioned. The rendered halves beam notes beat by beat mechanically; the number of beam
+lines or flags still gives the note value (1 = eighth, 2 = 16th, 3 = 32nd).
+Look at each of those measures note by note, in both hands, in all three bands before you decide.
+Answer "A" or "B" only if that one matches the photo exactly in that measure; answer "neither" if both differ from the
+photo or you cannot tell.
+Finish with a line containing only RESULT: followed by a JSON object mapping each of those measure numbers to
+"A", "B" or "neither", like {{"12": "A", "13": "neither"}}."""
+
+
+def pick_page(song, n):
+    """homr と Audiveris が食い違った小節を、段ごとに写真と両方の描き直しを並べて Claude に選ばせ、p{n}.musicxml に反映する。
+    どちらとも決まらなかった小節を {小節番号: 理由} で返す。段の切り出し (cut_systems) は済んでいること。"""
+    d = LIB / song
+    if not (d / f"p{n}_alt.musicxml").exists():
+        return {}
+    update_meta(song, step={"phase": "pick", "page": n})
+    page = d / f"p{n}.musicxml"
+    tree, alt = ET.parse(page), ET.parse(d / f"p{n}_alt.musicxml").getroot()
+    differ = set(json.loads((d / f"p{n}_alt.json").read_text()))
+    systems = [s for s in compare_images(d, n, [("A (machine reading A)", copy.deepcopy(tree.getroot())),
+                                                 ("B (machine reading B)", copy.deepcopy(alt))], name="pick")
+               if s[1] & differ]
+
+    def ask(system):
+        nums = sorted(system[1] & differ, key=int)
+        try:
+            got = result(claude(d, PICK.format(image=f"p{n}_pick{system[0]}.png", measures=", ".join(nums)), edit=False))
+        except Exception:
+            got = {}
+        return {m: got.get(m) if isinstance(got, dict) else None for m in nums}
+    with ThreadPoolExecutor(6) as pool:
+        choice = {m: c for found in pool.map(ask, systems) for m, c in found.items()}
+    take = {m.get("number"): m for m in alt.find("part").findall("measure") if choice.get(m.get("number")) == "B"}
+    for part in tree.getroot().findall("part"):
+        for i, m in enumerate(list(part)):
+            if m.tag == "measure" and m.get("number") in take:
+                part[i] = take[m.get("number")]
+    tree.write(page, encoding="UTF-8", xml_declaration=True)
+    with open(d / f"p{n}_pick.jsonl", "a") as f:  # 何を選んだかの記録
+        f.write(json.dumps(choice) + "\n")
+    if take:
+        update_meta(song, log={"kind": "proof", "page": n, "text": "2つの読み取りが食い違った第" + "・".join(sorted(take, key=int))
+                               + "小節は、写真と見比べて Audiveris の読みを採りました。"})
+    return {m: "2つの読み取りが食い違い、写真と見比べてもどちらとも決まりませんでした"
+            for m in differ if choice.get(m) not in ("A", "B")}
+
+
 def proof_page(song, n):
     """p{n}.musicxml を写真と照合して直し、描き直して見比べる。Claude が使えなくても例外は出さない。"""
     d = LIB / song
     page = d / f"p{n}.musicxml"
     strips = [f"p{n}_s{k}.jpg" for k in range(1, cut_systems(d, n) + 1)]
+    try:  # 2つの読み取りが食い違った小節を先に決める。決まらなかった小節は、校正と見比べのあとも印を残す
+        unsure = pick_page(song, n)
+    except Exception as e:
+        unsure = {}
+        update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
+    update_meta(song, flags={**read_meta(song).get("flags", {}), **unsure})
     update_meta(song, step={"phase": "proof", "page": n})
     try:
         summary = claude_edit(d, page, f"""You are proofreading optical music recognition (OMR) output for a piano score.
@@ -586,6 +646,14 @@ def second_opinion(d, n, root):
     except Exception:  # 読めなかったときは homr だけで進める
         return None
     res = consensus.merge(root, aud)
+    (d / f"p{n}_alt.musicxml").unlink(missing_ok=True)
+    if res["alt"]:  # 食い違った小節を Audiveris の読みにしたページ。どちらを採るかは pick_page で決める
+        alt = copy.deepcopy(root)
+        measures = alt.find("part").findall("measure")
+        for i, m in res["alt"].items():
+            consensus.transplant(measures[i], copy.deepcopy(m))
+        ET.ElementTree(alt).write(d / f"p{n}_alt.musicxml", encoding="UTF-8", xml_declaration=True)
+        (d / f"p{n}_alt.json").write_text(json.dumps([measures[i].get("number") for i in res["alt"]]))
     total = len(root.findall("part[1]/measure"))
     text = f"2つ目の読み取り (Audiveris) と {len(res['agree'])}/{total} 小節が一致しました。"
     if res["replaced"]:

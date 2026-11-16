@@ -178,20 +178,28 @@ def tuplet_marks(root):
                         ET.SubElement(notations, "tuplet", type=kind, number="1")
 
 
-def compare_images(d, n):
-    """ページ n の段ごとに p{n}_c{k}.png (上: 写真 / 下: 描き直し) を作り、[(k, {その段の小節番号})] を返す。
-    段の数が写真と合わないときは対応が取れないので [] を返す。"""
-    root = ET.parse(d / f"p{n}.musicxml").getroot()
+def prepare(root):
+    """見比べ用に描き直す前の下ごしらえ (保存するデータには使わない)。XML の文字列を返す。"""
     show_accidentals(root)
     beat_beams(root)
     tuplet_marks(root)
     for m in root.iter("measure"):
         tidy(m)
-    xml = ET.tostring(root, encoding="unicode")
-    measures = root.find("part").findall("measure")
+    return ET.tostring(root, encoding="unicode")
+
+
+def compare_images(d, n, versions=None, name="c"):
+    """ページ n の段ごとに p{n}_{name}{k}.png (上: 写真 / 下: データの描き直し) を作り、[(k, {その段の小節番号})] を返す。
+    versions は [(見出し, root)]。省略すると p{n}.musicxml を1つ描く。複数なら写真の下に順に並べる (小節の並びは同じこと)。
+    段の数が写真と合わないときは対応が取れないので [] を返す。"""
+    if versions is None:
+        versions = [("RENDERED (from the data - measure numbers shown)", ET.parse(d / f"p{n}.musicxml").getroot())]
+    measures = versions[0][1].find("part").findall("measure")
     starts = [i for i, m in enumerate(measures) if i == 0 or m.find("print[@new-system='yes']") is not None]
     if len(starts) != len(list(d.glob(f"p{n}_s*.jpg"))):
         return []
+    numbers = [{m.get("number") for m in measures[a:b]} for a, b in zip(starts, starts[1:] + [len(measures)])]
+    xmls = [(label, prepare(root)) for label, root in versions]
     tk = verovio.toolkit(False)
     tk.setResourcePath(str(Path(verovio.__file__).parent / "data"))  # 既定の場所は別スレッドからは引き継がれない
     tk.setOptions({"breaks": "none", "pageWidth": 20000, "pageHeight": 3000, "noJustification": True, "scale": 100,
@@ -199,20 +207,21 @@ def compare_images(d, n):
     systems = []
     for k, first in enumerate(starts, 1):
         last = starts[k] if k < len(starts) else len(measures)
-        tk.select({"measureRange": f"{first + 1}-{last}"})  # 小節は番号ではなく並び順で指定する
-        tk.loadData(xml)
-        png = bytes(resvg_py.svg_to_bytes(svg_string=tk.renderToSVG(1), background="white"))
-        drawn = Image.open(io.BytesIO(png)).convert("RGB")
-        drawn = ImageOps.expand(drawn.crop(ImageOps.invert(drawn).getbbox()), 30, "white")
         photo = Image.open(d / f"p{n}_s{k}.jpg")
-        photo = photo.resize((WIDTH, photo.height * WIDTH // photo.width))
-        drawn = drawn.resize((WIDTH, drawn.height * WIDTH // drawn.width))
-        sheet = Image.new("RGB", (WIDTH, photo.height + drawn.height + 80), "white")
-        draw = ImageDraw.Draw(sheet)
-        draw.text((10, 8), "PHOTO (the printed score - ground truth)", fill="red", font_size=22)
-        sheet.paste(photo, (0, 40))
-        draw.text((10, photo.height + 48), "RENDERED (from the data - measure numbers shown)", fill="blue", font_size=22)
-        sheet.paste(drawn, (0, photo.height + 80))
-        sheet.save(d / f"p{n}_c{k}.png")
-        systems.append((k, {m.get("number") for m in measures[first:last]}))
+        bands = [("PHOTO (the printed score - ground truth)", "red", photo.resize((WIDTH, photo.height * WIDTH // photo.width)))]
+        for label, xml in xmls:
+            tk.select({"measureRange": f"{first + 1}-{last}"})  # 小節は番号ではなく並び順で指定する
+            tk.loadData(xml)
+            png = bytes(resvg_py.svg_to_bytes(svg_string=tk.renderToSVG(1), background="white"))
+            drawn = Image.open(io.BytesIO(png)).convert("RGB")
+            drawn = ImageOps.expand(drawn.crop(ImageOps.invert(drawn).getbbox()), 30, "white")
+            bands.append((label, "blue", drawn.resize((WIDTH, drawn.height * WIDTH // drawn.width))))
+        sheet = Image.new("RGB", (WIDTH, sum(im.height + 40 for _, _, im in bands)), "white")
+        draw, y = ImageDraw.Draw(sheet), 0
+        for label, color, im in bands:
+            draw.text((10, y + 8), label, fill=color, font_size=22)
+            sheet.paste(im, (0, y + 40))
+            y += im.height + 40
+        sheet.save(d / f"p{n}_{name}{k}.png")
+        systems.append((k, numbers[k - 1]))
     return systems

@@ -2,6 +2,7 @@
 
 bench/truth/*.musicxml (正解。make_truth.py で作る) を PDF と同じきれいな画像にし、アプリの読み取りに通して、鳴る音の食い違いを数える。
   uv run python bench.py raw              校正なし
+  uv run python bench.py pick --yes-full  2つの読み取りの食い違いを Claude に選ばせるところまで (Claude を使う)
   uv run python bench.py full --yes-full  Claude を使う本番どおりの処理 (サブスクリプションを使う)
   uv run python bench.py --selftest       採点そのものの検算
   --piece=名前 (繰り返し可) で曲を、--cond=verovio|musescore で描き方を絞る。--test で test_ の曲も測る。--label=名前 で結果の名前を付ける
@@ -35,7 +36,7 @@ TRUTH, WORK = BENCH / "truth", BENCH / "work"
 WIDTH = 2000  # アプリ (index.html) が PDF のページを画像にするときの横幅。JPEG の品質 0.92 も合わせる
 FONTS = ("Leland", "Bravura", "Gootville", "Leipzig")  # Verovio で描くときの字体。曲ごとに替え、PDF を作るソフトの違いに近づける
 MSCORE = "/Applications/MuseScore 4.app/Contents/MacOS/mscore"  # brew install --cask musescore
-STAGES = ("raw", "full")
+STAGES = ("raw", "pick", "full")
 CONDS = ("verovio", "musescore")
 NAMES = "C C# D D# E F F# G G# A A# B".split()
 
@@ -245,8 +246,14 @@ class patched:
         self.saved = server.LIB, server.proof_page, server.subprocess
         server.LIB = WORK / "lib"
         server.subprocess = types.SimpleNamespace(run=cached_run(subprocess.run, WORK), DEVNULL=subprocess.DEVNULL)
-        if self.stage != "full":
+        if self.stage == "raw":
             server.proof_page = lambda song, n: None
+        if self.stage == "pick":  # 2つの読み取りの食い違いを Claude に選ばせるところまで。決まらなかった小節に印を付ける
+            def pick(song, n):
+                server.cut_systems(server.LIB / song, n)
+                flags = server.pick_page(song, n)
+                server.update_meta(song, flags={**server.read_meta(song).get("flags", {}), **flags})
+            server.proof_page = pick
 
     def __exit__(self, *a):
         server.LIB, server.proof_page, server.subprocess = self.saved
@@ -366,7 +373,7 @@ def main(argv):
     if not stages or not pieces:
         raise SystemExit(__doc__)
     pages = {p: engrave(p) for p in pieces}
-    if "full" in stages:
+    if "full" in stages or "pick" in stages:
         n = sum(pages[p][c] for p in pieces for c in conds)
         print(f"full は Claude を使う本番どおりの処理です。{n}ページ処理します (1ページ数分、Claude を10回前後呼ぶ)")
         if "--yes-full" not in argv:
