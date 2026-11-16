@@ -610,6 +610,25 @@ def pick_page(song, n):
             for m in differ if choice.get(m) not in ("A", "B")}
 
 
+def audit_page(song, n):
+    """仕上がったデータを描き直して、もう一度だけ写真と見比べる。直さずに、違うと言われた小節を {小節番号: 理由} で返す。
+    見比べは1段につき1〜2割の確率で見落とすので、別の回でもう一度見て、見落としを印として残す。"""
+    d = LIB / song
+    update_meta(song, step={"phase": "audit", "page": n})
+    systems = compare_images(d, n, name="a")
+
+    def check(system):
+        try:
+            found = result(claude(d, CHECK.format(image=f"p{n}_a{system[0]}.png"), edit=False))
+        except Exception:
+            return {}
+        return {str(f.get("measure")): str(f.get("issue", ""))[:200] for f in found
+                if isinstance(f, dict) and str(f.get("measure")) in system[1]}
+    with ThreadPoolExecutor(6) as pool:
+        found = {m: why for got in pool.map(check, systems) for m, why in got.items()}
+    return {m: "最後の見比べで写真と違うと言われました: " + why for m, why in found.items()}
+
+
 def keep_agreed(d, n, before):
     """校正の前 (before: p{n}.musicxml の中身) に homr と Audiveris が一致していた小節の音を、校正が変えていたら元に戻す。
     一致した小節はほぼ正しく (試験台で96%)、校正のほうが写真を読み違えて書き換えることがあるため。
@@ -667,6 +686,7 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
             update_meta(song, log={"kind": "proof", "page": n, "text": "2つの読み取りが一致していた第" + "・".join(kept)
                                    + "小節は、校正での書き換えを取り消しました。"})
         flags = verify_page(song, n)
+        flags = {**audit_page(song, n), **flags}  # 見比べの見落としを、もう1回の見比べで拾って印にする
         update_meta(song, flags={**read_meta(song).get("flags", {}), **flags})
     except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
         update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
