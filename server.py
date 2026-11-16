@@ -272,7 +272,8 @@ def retime(measure):
 
 def slurs_to_ties(part):
     """homr はタイを「同じ高さの音を結ぶスラー」として、しかも和音の1音にだけ書き出すので、再生で弾き直してしまう。
-    ある音が終わった瞬間に始まる同じ高さの音へのスラーをタイに置き換え、2つの和音の共通音をすべてタイでつなぐ。"""
+    ある音が終わった瞬間に始まる同じ高さの音へのスラーをタイに置き換え、2つの和音の共通音をすべてタイでつなぐ。
+    タイとして書かれていても和音の1音だけのことがあるので、それも共通音をすべてつなぐ。"""
     # defer: 和音の共通音は全部つなぐ (一部だけタイで残りは弾き直す譜面は誤る)。そういう曲が出たら弧の上下位置で選ぶ
     notes, t0 = [], 0  # (staff, 開始位置, 長さ, note)
     for m in part.findall("measure"):
@@ -308,11 +309,19 @@ def slurs_to_ties(part):
                     continue  # 本物のスラー
                 e1.find("notations").remove(s1)
                 e.find("notations").remove(s)
-                for a in at[(staff, t1)]:
-                    for b in at[(staff, t)]:
-                        if pitch(a) == pitch(b):
-                            add_tie(a, "start")
-                            add_tie(b, "stop")
+                tie_chords(at[(staff, t1)], at[(staff, t)], pitch)
+    for staff, t, d, e in notes:  # homr 0.7.1 はタイも和音の1音にだけ書く。同じ高さの共通音をすべてつなぐ
+        if e.find("tie[@type='start']") is not None and (staff, t + d) in at:
+            if any(pitch(b) == pitch(e) for b in at[(staff, t + d)]):
+                tie_chords(at[(staff, t)], at[(staff, t + d)], pitch)
+
+
+def tie_chords(first, second, pitch):
+    for a in first:
+        for b in second:
+            if pitch(a) == pitch(b):
+                add_tie(a, "start")
+                add_tie(b, "stop")
 
 
 def add_tie(note, kind):
