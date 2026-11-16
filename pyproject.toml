@@ -7,3 +7,9 @@ dependencies = [
     "resvg-py>=0.5.0",
     "verovio>=6.4.1",
 ]
+
+[dependency-groups]
+dev = [
+    "music21>=10.5.2",
+    "pypdfium2>=5.15.2",
+]

@@ -54,22 +54,27 @@ uv run server.py
 ## 読み取りの出来を測る (開発用)
 
 正解の分かっている楽譜を読み取らせて、間違いを数える。変更が良くなったかどうかを数字で見るためのもの。
+対象は PDF の楽譜 (きれいな印刷譜)。試した策と結果は [docs/experiments.md](docs/experiments.md) にまとめている。
 
 ```bash
-uv run python bench.py --selftest      # 採点そのものの検算
-uv run python bench.py raw fixed       # 校正なし。fixed はオクターブの自動修正あり。1回目は数分 (OMR は結果を取っておく)
-uv run python bench.py full --yes-full # 校正まで本番どおり。Claude を使う (サブスクリプションを消費する) ので、必要なときだけ
+brew install --cask musescore                 # 正解を MuseScore で PDF にするのに使う
+uv run --with music21 python make_truth.py    # 正解を作る (初回だけ)
+uv run python bench.py --selftest             # 採点そのものの検算
+uv run python bench.py raw fixed              # 校正なし。fixed はオクターブの自動修正あり。1回目は OMR に時間がかかる (結果は取っておく)
+uv run python bench.py full --yes-full        # 校正まで本番どおり。Claude を使う (サブスクリプションを消費する) ので、必要なときだけ
 ```
 
-- `bench/truth/*.musicxml` が正解 (置いたぶんだけ測る。`--piece=名前` で1曲だけ)。
-  music21 のコーパスから作った。コーパスの権利は別なので `bench/` は git に入れない。
-- 正解を Verovio でページ画像にし (字体は Leland)、きれいな画像 (`clean`) と、傾き・ぼかし・明るさのむら・JPEG 圧縮を足した画像 (`photo`) の2通りで読み取る。
+- `bench/truth/*.musicxml` が正解。music21 のコーパスから `make_truth.py` で作る (20曲)。
+  コーパスの権利は別なので `bench/` は git に入れない。`test_` で始まる曲は `--test` を付けたときだけ測る (改善の判断に使わない)。
+- 正解を Verovio (字体を曲ごとに替える) と MuseScore 4 の PDF の2通りでページ画像にし、
+  アプリが PDF を取り込むときと同じく横2000px・JPEG 品質0.92 で読み取る。
 - 採点は「鳴る音」で行う。小節ごとに両手の音 (高さ・位置・長さ) が全部合っていれば正解。
   音の食い違いは、オクターブ違い・半音違い (臨時記号)・その他の高さ違い・長さ違い・位置違い・欠け・余りに分ける。
-- 結果は `bench/work/results_<段階>.json` に、間違えた小節ごとの食い違いが入る。
+  間違っているのに「確かめきれなかった」印がない小節 (silent) も数える。人が確かめなくてよいのは、これが 0 のとき。
+- 結果は `bench/work/results_<段階>[_<label>].json` に、毎回の合計は `bench/work/history.jsonl` に残る。
 - リピート、テンポ、強弱、スラー、連桁は採点しない。
 
-### これまでに測って分かったこと
+### これまでに測って分かったこと (写真風の画像も使っていたころ)
 
 正解つきの7曲 (12ページ、193小節、2970音) で測った。校正つきの測定は1回ずつなので、数小節の差は Claude の揺れと区別できない。
 
