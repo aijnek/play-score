@@ -727,7 +727,9 @@ def spots(part):
 
 def borrow_ties(homr, aud):
     """Audiveris がタイでつないだ (同じ高さのスラーを含む) 2つの音と同じ位置に、homr も同じ高さの音を読んでいれば、
-    homr の音もタイでつなぐ。homr は弧を見落としやすい。Audiveris は音部記号を読み違えて高さを誤っても、弧の位置は合っている。"""
+    homr の音もタイでつなぐ。homr は弧を見落としやすい。Audiveris は音部記号を読み違えて高さを誤っても、弧の位置は合っている。
+    ただし Audiveris は弧のないところにタイを付けることもあるので、タイを足した homr の小節の並び順を返し、一致とは扱わない。"""
+    added = set()
     pitch = lambda e: (e.findtext("pitch/step"), e.findtext("pitch/octave"), float(e.findtext("pitch/alter") or 0))
     H, A = spots(homr.find("part")), spots(aud.find("part"))
     to_h = {j: i for i, j in consensus.align(consensus.events(homr), consensus.events(aud))}
@@ -746,7 +748,11 @@ def borrow_ties(homr, aud):
                 common = {pitch(a) for a in first} & {pitch(b) for b in second}
                 p = pitch(e) if pitch(e) in common else next(iter(common)) if len(common) == 1 else None
                 if p:  # 共通音が2つ以上で Audiveris の高さと合わないときは、どれをつなぐか決められないので触らない
-                    tie_chords([a for a in first if pitch(a) == p], [b for b in second if pitch(b) == p], pitch)
+                    first = [a for a in first if pitch(a) == p]
+                    if any(a.find("tie[@type='start']") is None for a in first):
+                        added |= {to_h[j], to_h[j2]}
+                    tie_chords(first, [b for b in second if pitch(b) == p], pitch)
+    return added
 
 
 def second_opinion(d, n, root):
@@ -762,10 +768,11 @@ def second_opinion(d, n, root):
             aud = ET.fromstring(z.read(next(f for f in z.namelist() if not f.startswith("META-INF"))))
     except Exception:  # 読めなかったときは homr だけで進める
         return None
+    borrowed = set()
     if aud.find("part") is not None:
         slurs_to_ties(aud.find("part"))
-        borrow_ties(root, aud)
-    res = consensus.merge(root, aud)
+        borrowed = borrow_ties(root, aud)
+    res = consensus.merge(root, aud, borrowed)
     (d / f"p{n}_alt.musicxml").unlink(missing_ok=True)
     measures = root.find("part").findall("measure")
     (d / f"p{n}_agree.json").write_text(json.dumps([measures[i].get("number") for i in res["agree"]]))

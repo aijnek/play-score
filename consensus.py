@@ -130,11 +130,12 @@ def transplant(dst, src):
     dst[:] = lead + body + [e for e in kids if e.tag == "barline"]
 
 
-def merge(homr, aud):
+def merge(homr, aud, doubtful=()):
     """homr のページ (root) を土台に、Audiveris (root) と小節ごとに突き合わせる。homr を書き換え、
     {"agree": [小節の並び順], "replaced": [...], "disagree": [...], "alt": {並び順: Audiveris の小節}} を返す。
     一致しない小節は、homr が拍子に合わず Audiveris が合うときだけ Audiveris の音に入れ替える。
-    それ以外の食い違いは alt に Audiveris の小節 (分解能はそろえ済み) を残し、どちらを採るかは後で決める。"""
+    それ以外の食い違いは alt に Audiveris の小節 (分解能はそろえ済み) を残し、どちらを採るかは後で決める。
+    doubtful (homr の小節の並び順) は、音が同じでも一致とせず disagree に入れる (alt は残さない)。"""
     hp, ap = homr.find("part"), aud.find("part")
     res = {"agree": [], "replaced": [], "disagree": [], "alt": {}}
     if hp is None or ap is None or not common_divisions(hp, ap):
@@ -143,8 +144,11 @@ def merge(homr, aud):
     hm, am = hp.findall("measure"), ap.findall("measure")
     div = int(next(hp.iter("divisions")).text)
     for i, j in align(H, A):
-        if Counter(H[i]["ev"]) == Counter(A[j]["ev"]):
+        same = Counter(H[i]["ev"]) == Counter(A[j]["ev"])
+        if same and i not in doubtful:
             res["agree"].append(i)
+        elif same:
+            res["disagree"].append(i)
         elif not fills(hm[i], div, H[i]["time"]) and fills(am[j], div, H[i]["time"]):
             transplant(hm[i], am[j])
             res["replaced"].append(i)
