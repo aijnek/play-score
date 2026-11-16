@@ -28,7 +28,6 @@ import numpy as np  # homr の依存として入っている
 from PIL import Image, ImageOps
 
 import consensus
-import measure
 from render import LEVELS, compare_images, set_beams
 
 ROOT = Path(__file__).parent
@@ -36,20 +35,8 @@ LIB = ROOT / "library"
 # homr を子プロセスで動かすスクリプト。onnxruntime は既定で利用状況を Microsoft に送信し、その送信待ちで
 # 終了時に固まることがあるので、送信を切ったうえで、結果を書き終えたら後始末を待たずに終了する。
 HOMR = """
-import os, sys, json, traceback, onnxruntime
+import os, sys, traceback, onnxruntime
 onnxruntime.disable_telemetry_events()
-import homr.main
-detect = homr.main.detect_staffs_in_image
-def detect_and_dump(path, config):
-    res = detect(path, config)
-    try:  # 測った結果を残す。失敗しても homr の結果はそのまま使う
-        geo = [[{"notes": [[n.center[0], n.center[1]] for n in s.get_notes()], "grid": [[p.x, *p.y] for p in s.grid]}
-                for s in ms.staffs] for ms in res[0]]
-        json.dump(geo, open(os.path.splitext(path)[0] + "_geo.json", "w"))
-    except Exception:
-        traceback.print_exc()
-    return res
-homr.main.detect_staffs_in_image = detect_and_dump
 from homr.main import main
 try:
     main()
@@ -609,7 +596,6 @@ def second_opinion(d, n, root):
 def process_page(song, n):
     d = LIB / song
     update_meta(song, step={"phase": "omr", "page": n})
-    (d / f"p{n}_geo.json").unlink(missing_ok=True)  # 前の測定が残っていると、別の写真の結果を使ってしまう
     r = subprocess.run([sys.executable, "-c", HOMR, "--write-staff-positions", f"p{n}.jpg"], cwd=d, capture_output=True, text=True)
     page = d / f"p{n}.musicxml"
     if not page.exists():
@@ -625,17 +611,10 @@ def process_page(song, n):
             retime(m)
             m.set("number", str(offset + i))
         slurs_to_ties(part)
-    try:  # 測定が使えなくても読み取りは進める
-        fixed = measure.fix_octaves(tree.getroot(), json.loads((d / f"p{n}_geo.json").read_text()))
-    except Exception:
-        fixed = []
     agreed = second_opinion(d, n, tree.getroot())
     tree.write(page, encoding="UTF-8", xml_declaration=True)
     if agreed:
         update_meta(song, log={"kind": "proof", "page": n, "text": agreed})
-    if fixed:
-        where = "・".join(f"第{m}小節の{'右手' if st == 1 else '左手'}" for m, st in fixed)
-        update_meta(song, log={"kind": "proof", "page": n, "text": f"音符の位置を測り、{where}を1オクターブ直しました。"})
 
     proof_page(song, n)
 

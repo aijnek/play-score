@@ -8,6 +8,8 @@
 - [uv](https://docs.astral.sh/uv/)
 - [Claude Code](https://claude.com/claude-code)（`claude` を起動して `/login` 済みであること。校正に使う）
 - インターネット接続（ピアノ音源と描画ライブラリをCDNから読み込む）
+- あれば精度が上がる: [Audiveris](https://github.com/Audiveris/audiveris/releases)（公式の GitHub から macOS 版の dmg を入れ、`/Applications` に置く。
+  audiveris.com などの非公式サイトから入れないこと）
 
 ## 起動
 
@@ -29,7 +31,7 @@ uv run server.py
 ## しくみ
 
 1. [homr](https://github.com/liebharc/homr) が画像を MusicXML にする（ローカルで実行）。
-   homr が音符の位置を五線の上で測った結果は、オクターブの読み違いを直すのに使う。
+   [Audiveris](https://github.com/Audiveris/audiveris) が入っていれば、それでも読み、2つを小節ごとに突き合わせる。
 2. Claude Code が写真と見比べて MusicXML を直す（サブスクリプションの範囲で実行）。
    連符は Claude が「何個を何個ぶんの長さで弾くか」だけを書き、音の長さはコードが計算する（5連符や13連符は割り切れないため）。
 3. 直したデータを五線譜に描き直し（Verovio）、写真の段と上下に並べて Claude が1段ずつ見比べる。
@@ -60,7 +62,7 @@ uv run server.py
 brew install --cask musescore                 # 正解を MuseScore で PDF にするのに使う
 uv run --with music21 python make_truth.py    # 正解を作る (初回だけ)
 uv run python bench.py --selftest             # 採点そのものの検算
-uv run python bench.py raw fixed              # 校正なし。fixed はオクターブの自動修正あり。1回目は OMR に時間がかかる (結果は取っておく)
+uv run python bench.py raw                    # 校正なし。1回目は OMR に時間がかかる (結果は取っておく)
 uv run python bench.py full --yes-full        # 校正まで本番どおり。Claude を使う (サブスクリプションを消費する) ので、必要なときだけ
 ```
 
@@ -83,7 +85,8 @@ uv run python bench.py full --yes-full        # 校正まで本番どおり。Cl
 - 校正と見比べは効く。モーツァルト K.545 とショパンのマズルカ (きれいな画像、65小節) は 57 → 65 小節。
   C.P.E. バッハ H.186 (写真風、32小節。5連符・13連符がある) は 21 → 25〜26 小節。
 - オクターブの自動修正 (`measure.py`) は、校正なしで1小節良くなり、悪くなった小節はない。
-  本物の写真14ページでは20音を正しく直し、1音を誤って動かした (8va の下の音)。残している。
+  本物の写真14ページでは20音を正しく直し、1音を誤って動かした (8va の下の音)。
+  のちに PDF だけを対象にしたとき、良くした小節がなく加線の多い高音を誤って動かしたので外した (docs/experiments.md)。
 - 校正の最初に「先に見る場所」を伝える手がかりを2種類試して、外した。
   1つは音符の位置の測定がデータと食い違う音、もう1つは音の長さを足すと拍子に合わない小節。
   C.P.E. バッハで、手がかりなしは 26/32 小節、ありは 25/32 小節で、差が出なかった。

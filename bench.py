@@ -1,7 +1,7 @@
 """正解つきの楽譜で、読み取りの出来を数える開発用ツール (render.py と同じく、アプリ本体からは使わない)。
 
 bench/truth/*.musicxml (正解。make_truth.py で作る) を PDF と同じきれいな画像にし、アプリの読み取りに通して、鳴る音の食い違いを数える。
-  uv run python bench.py raw fixed        校正なし (fixed はオクターブの自動修正あり)
+  uv run python bench.py raw              校正なし
   uv run python bench.py full --yes-full  Claude を使う本番どおりの処理 (サブスクリプションを使う)
   uv run python bench.py --selftest       採点そのものの検算
   --piece=名前 (繰り返し可) で曲を、--cond=verovio|musescore で描き方を絞る。--test で test_ の曲も測る。--label=名前 で結果の名前を付ける
@@ -27,7 +27,6 @@ import resvg_py
 import verovio
 from PIL import Image
 
-import measure
 import server
 from consensus import align, events
 
@@ -36,7 +35,7 @@ TRUTH, WORK = BENCH / "truth", BENCH / "work"
 WIDTH = 2000  # アプリ (index.html) が PDF のページを画像にするときの横幅。JPEG の品質 0.92 も合わせる
 FONTS = ("Leland", "Bravura", "Gootville", "Leipzig")  # Verovio で描くときの字体。曲ごとに替え、PDF を作るソフトの違いに近づける
 MSCORE = "/Applications/MuseScore 4.app/Contents/MacOS/mscore"  # brew install --cask musescore
-STAGES = ("raw", "fixed", "full")
+STAGES = ("raw", "full")
 CONDS = ("verovio", "musescore")
 NAMES = "C C# D D# E F F# G G# A A# B".split()
 
@@ -204,7 +203,7 @@ def cached_run(real, cache):
             if not (d / f"{name}.musicxml").exists():
                 return r
             key.mkdir(parents=True, exist_ok=True)
-            for f in (f"{name}.musicxml", f"{name}_geo.json", f"{name}.txt"):
+            for f in (f"{name}.musicxml", f"{name}.txt"):
                 if (d / f).exists():
                     shutil.copy(d / f, key / f)
             return r
@@ -238,21 +237,19 @@ def read_song(name, cond, stage):
 
 class patched:
     """読み取りを試験用にする: library/ には書かない、OMR の結果を使い回す。
-    raw / fixed は Claude を呼ぶ proof_page を空にする。full は本物 (呼び出し側が許可を確認済み)。raw はオクターブ修正も外す。"""
+    raw は Claude を呼ぶ proof_page を空にする。full は本物 (呼び出し側が許可を確認済み)。"""
     def __init__(self, stage):
         self.stage = stage
 
     def __enter__(self):
-        self.saved = server.LIB, server.proof_page, server.subprocess, measure.fix_octaves
+        self.saved = server.LIB, server.proof_page, server.subprocess
         server.LIB = WORK / "lib"
         server.subprocess = types.SimpleNamespace(run=cached_run(subprocess.run, WORK), DEVNULL=subprocess.DEVNULL)
         if self.stage != "full":
             server.proof_page = lambda song, n: None
-        if self.stage == "raw":
-            measure.fix_octaves = lambda root, geo: []
 
     def __exit__(self, *a):
-        server.LIB, server.proof_page, server.subprocess, measure.fix_octaves = self.saved
+        server.LIB, server.proof_page, server.subprocess = self.saved
 
 
 # ---------- 集計 ----------
