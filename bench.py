@@ -19,7 +19,6 @@ import xml.etree.ElementTree as ET
 import zlib
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +29,7 @@ from PIL import Image
 
 import measure
 import server
+from consensus import align, events
 
 BENCH = Path(__file__).parent / "bench"
 TRUTH, WORK = BENCH / "truth", BENCH / "work"
@@ -39,7 +39,6 @@ MSCORE = "/Applications/MuseScore 4.app/Contents/MacOS/mscore"  # brew install -
 STAGES = ("raw", "fixed", "full")
 CONDS = ("verovio", "musescore")
 NAMES = "C C# D D# E F F# G G# A A# B".split()
-STEP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 
 # defer: リピート・括弧・D.C.・テンポ・強弱・スラー・連桁・音部記号の種類は採点しない (音の高さに反映済みか、鳴る音に関係しない)。
 # 校正や見比べがそれらを直す変更を入れたら、鳴る順に展開した比較と記号ごとの採点を足す
@@ -95,57 +94,6 @@ def musescore_pages(name):
 
 # ---------- 音の一覧と採点 ----------
 
-def q(x):
-    """music21 が書き出す連符は 827/5040 のように割り切れない長さになる。1/48 拍に丸めて、連符を正しい長さで比べる。
-    # defer: 1/48 拍より短い音 (32分の3連より細かい) は区別できない。そういう曲を入れる時に分解能を上げる"""
-    return Fraction(round(x * 48), 48)
-
-
-def events(root):
-    """最初のパートを小節ごとの {"ev": [(段, 拍位置, 高さ, 長さ)], "key", "time"} にする。位置と長さは4分音符を1とする分数。
-    タイでつながった音は小節をまたいでも1つにまとめ、装飾音符と休符は数えない。声部は区別しない。
-    同じ手・同じ時刻・同じ高さの音は1つにまとめる。"""
-    out, div, key, time, open_ties = [], 1, 0, ("4", "4"), {}
-    for m in root.find("part").findall("measure"):
-        ev, cursor, last = [], 0, 0
-        for el in m:
-            if el.tag == "attributes":
-                div = int(el.findtext("divisions", div))
-                key = int(el.findtext("key/fifths", key))
-                t = el.find("time")
-                time = (t.findtext("beats"), t.findtext("beat-type")) if t is not None else time
-            elif el.tag in ("backup", "forward"):
-                cursor += int(el.findtext("duration")) * (-1 if el.tag == "backup" else 1)
-            elif el.tag == "note" and el.find("grace") is None:
-                dur = int(el.findtext("duration", "0"))
-                onset = last if el.find("chord") is not None else cursor
-                if el.find("chord") is None:
-                    last, cursor = cursor, cursor + dur
-                p = el.find("pitch")
-                if p is None:
-                    continue
-                midi = 12 * (int(p.findtext("octave")) + 1) + STEP[p.findtext("step")] + int(float(p.findtext("alter", "0")))
-                staff = int(el.findtext("staff", "1"))
-                tied = {t.get("type") for t in el.findall("tie")} | {t.get("type") for t in el.findall("notations/tied")}
-                if "stop" in tied and (staff, midi) in open_ties:
-                    open_ties[(staff, midi)][3] += Fraction(dur, div)
-                    if "start" not in tied:
-                        del open_ties[(staff, midi)]
-                    continue
-                e = [staff, Fraction(onset, div), midi, Fraction(dur, div)]
-                ev.append(e)
-                if "start" in tied:
-                    open_ties[(staff, midi)] = e
-        out.append({"ev": ev, "key": key, "time": time})
-    for m in out:  # 同じ手で同時に同じ鍵を押す音 (2つの声部が符頭を共有するなど) は1つしか鳴らないので、長いほうだけ残す
-        longest = {}
-        for e in m["ev"]:
-            k = (e[0], q(e[1]), e[2])
-            longest[k] = max(longest.get(k, 0), q(e[3]))
-        m["ev"] = [(*k, d) for k, d in longest.items()]
-    return out
-
-
 def fmt(e):
     return {"staff": e[0], "onset": str(e[1]), "pitch": f"{NAMES[e[2] % 12]}{e[2] // 12 - 1}", "dur": str(e[3])}
 
@@ -190,30 +138,6 @@ def diff_measure(T, R):
     return n, why
 
 
-def align(T, R):
-    """小節の並びどうしを Needleman-Wunsch で合わせる (アプリは小節を落とす・割る・足すことがある)。
-    費用は音の食い違いの数。(truthの添字, resultの添字) の組を返す。"""
-    cost = lambda a, b: sum(((Counter(a["ev"]) - Counter(b["ev"])) + (Counter(b["ev"]) - Counter(a["ev"]))).values())
-    n, m = len(T), len(R)
-    D = np.zeros((n + 1, m + 1))
-    D[:, 0] = np.cumsum([0] + [len(t["ev"]) + .5 for t in T])
-    D[0, :] = np.cumsum([0] + [len(r["ev"]) + .5 for r in R])
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            D[i, j] = min(D[i - 1, j - 1] + .9 * cost(T[i - 1], R[j - 1]),
-                          D[i - 1, j] + len(T[i - 1]["ev"]) + .5, D[i, j - 1] + len(R[j - 1]["ev"]) + .5)
-    i, j, pairs = n, m, []
-    while i and j:
-        if D[i, j] == D[i - 1, j - 1] + .9 * cost(T[i - 1], R[j - 1]):
-            pairs.append((i - 1, j - 1))
-            i, j = i - 1, j - 1
-        elif D[i, j] == D[i - 1, j] + len(T[i - 1]["ev"]) + .5:
-            i -= 1
-        else:
-            j -= 1
-    return pairs[::-1]
-
-
 def score(truth, result, flags=()):
     """正解と読み取り結果 (どちらも root) を比べる。{"n": 数, "right": [小節ごとの○×], "wrong": 食い違いのある小節の一覧}。
     flags はアプリが「確かめきれなかった」と印を付けた小節 (読み取り結果の小節番号)。間違っているのに印のない小節を
@@ -253,11 +177,24 @@ def score(truth, result, flags=()):
 # ---------- 読み取り ----------
 
 HOMR_VERSION = importlib.metadata.version("homr")  # 版が変われば OMR をやり直す
+AUDIVERIS_VERSION = "5.11.0"
 
 
 def cached_run(real, cache):
     """server.subprocess.run の代わり。homr を呼ぶ処理だけ、画像ごとに結果を bench/work/omr/ に取っておき、2回目からは OMR を飛ばす。"""
     def run(cmd, cwd=None, **kw):
+        if cmd[0] == server.AUDIVERIS:  # Audiveris も画像ごとに結果を取っておく
+            out, img = Path(cmd[4]), Path(cwd) / cmd[-1]
+            key = WORK / "audiveris" / f"{zlib.crc32(img.read_bytes()):08x}_{AUDIVERIS_VERSION}"
+            if not (key / "p.mxl").exists():
+                r = real(cmd, cwd=cwd, **kw)
+                if (out / f"{img.stem}.mxl").exists():
+                    key.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(out / f"{img.stem}.mxl", key / "p.mxl")
+                return r
+            out.mkdir(parents=True, exist_ok=True)
+            shutil.copy(key / "p.mxl", out / f"{img.stem}.mxl")
+            return types.SimpleNamespace(stderr="", stdout="", returncode=0)
         if "--write-staff-positions" not in cmd:
             return real(cmd, cwd=cwd, **kw)
         d, name = Path(cwd), Path(cmd[-1]).stem

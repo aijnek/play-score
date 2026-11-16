@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np  # homr の依存として入っている
 from PIL import Image, ImageOps
 
+import consensus
 import measure
 from render import LEVELS, compare_images, set_beams
 
@@ -58,6 +60,8 @@ except Exception:
 sys.stdout.flush(); sys.stderr.flush()
 os._exit(0)
 """
+# Audiveris (もう1つの OMR)。入っていなければ homr だけで読む。公式の配布元は https://github.com/Audiveris/audiveris/releases
+AUDIVERIS = "/Applications/Audiveris.app/Contents/MacOS/Audiveris"
 PORT = 8765
 HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}"}
 MAX_UPLOAD = 40 * 1024 * 1024
@@ -581,6 +585,27 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
     tree.write(page, encoding="UTF-8", xml_declaration=True)
 
 
+def second_opinion(d, n, root):
+    """Audiveris でも読み、homr の結果 (root) と小節ごとに突き合わせる。root を書き換え、知らせる文を返す (なければ None)。"""
+    if not Path(AUDIVERIS).exists():
+        return None
+    out = d / "audiveris"
+    shutil.rmtree(out, ignore_errors=True)
+    subprocess.run([AUDIVERIS, "-batch", "-export", "-output", str(out), f"p{n}.jpg"], cwd=d, capture_output=True, timeout=600)
+    try:
+        with zipfile.ZipFile(out / f"p{n}.mxl") as z:
+            aud = ET.fromstring(z.read(next(f for f in z.namelist() if not f.startswith("META-INF"))))
+    except Exception:  # 読めなかったときは homr だけで進める
+        return None
+    res = consensus.merge(root, aud)
+    total = len(root.findall("part[1]/measure"))
+    text = f"2つ目の読み取り (Audiveris) と {len(res['agree'])}/{total} 小節が一致しました。"
+    if res["replaced"]:
+        nums = [root.findall("part[1]/measure")[i].get("number") for i in res["replaced"]]
+        text += "拍子に合わなかった第" + "・".join(nums) + "小節は、Audiveris の読み取りに替えました。"
+    return text
+
+
 def process_page(song, n):
     d = LIB / song
     update_meta(song, step={"phase": "omr", "page": n})
@@ -604,7 +629,10 @@ def process_page(song, n):
         fixed = measure.fix_octaves(tree.getroot(), json.loads((d / f"p{n}_geo.json").read_text()))
     except Exception:
         fixed = []
+    agreed = second_opinion(d, n, tree.getroot())
     tree.write(page, encoding="UTF-8", xml_declaration=True)
+    if agreed:
+        update_meta(song, log={"kind": "proof", "page": n, "text": agreed})
     if fixed:
         where = "・".join(f"第{m}小節の{'右手' if st == 1 else '左手'}" for m, st in fixed)
         update_meta(song, log={"kind": "proof", "page": n, "text": f"音符の位置を測り、{where}を1オクターブ直しました。"})
