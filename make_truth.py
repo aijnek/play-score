@@ -18,6 +18,7 @@ TRUTH = Path(__file__).parent / "bench" / "truth"
 
 # 名前: (コーパスのパス, 先頭から何小節使うか)。 test_ で始まるものは改善の判断に使わない (最後に確かめるためだけに測る)
 PIANO = {
+    "schoenberg_op19_6": ("schoenberg/opus19/movement6", 10),  # 最初からあった7曲のうち、作り直したもの
     "clara_polonaise1": ("schumann_clara/polonaise_op1n1", 40),
     "clara_polonaise3": ("schumann_clara/polonaise_op1n3", 32),
     "dichterliebe2": ("schumann_robert/dichterliebe_no2", 18),

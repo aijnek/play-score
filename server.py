@@ -295,7 +295,7 @@ def slurs_to_ties(part):
     at = {}
     for staff, t, _, e in notes:
         at.setdefault((staff, t), []).append(e)
-    pitch = lambda e: (e.findtext("pitch/step"), e.findtext("pitch/octave"))
+    pitch = lambda e: (e.findtext("pitch/step"), e.findtext("pitch/octave"), float(e.findtext("pitch/alter") or 0))
     order = sorted(range(len(notes)), key=lambda i: notes[i][1])
     open_ = {}
     for i in order:
