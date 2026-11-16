@@ -138,11 +138,20 @@ def diff_measure(T, R):
     return n, why
 
 
+def head_aligned(ms):
+    """曲の最初の小節 (弱起のことが多い) は、最初の音の位置を0にそろえる。曲の頭の無音は弾き方に関係せず、
+    正解の元データには描かれない休符が入っていることがある (dichterliebe2)。"""
+    if ms and ms[0]["ev"]:
+        first = min(e[1] for e in ms[0]["ev"])
+        ms[0]["ev"] = [(e[0], e[1] - first, *e[2:]) for e in ms[0]["ev"]]
+    return ms
+
+
 def score(truth, result, flags=()):
     """正解と読み取り結果 (どちらも root) を比べる。{"n": 数, "right": [小節ごとの○×], "wrong": 食い違いのある小節の一覧}。
     flags はアプリが「確かめきれなかった」と印を付けた小節 (読み取り結果の小節番号)。間違っているのに印のない小節を
     silent、合っているのに印のある小節を false_flags と数える。人が確かめなくてよいと言えるのは silent が 0 のとき。"""
-    T, R = events(truth), events(result)
+    T, R = head_aligned(events(truth)), head_aligned(events(result))
     pairs = align(T, R)
     hit_t, hit_r = {i for i, _ in pairs}, {j for _, j in pairs}
     n = Counter(measures=len(T), result_measures=len(R), missing_measures=len(T) - len(hit_t), extra_measures=len(R) - len(hit_r))
