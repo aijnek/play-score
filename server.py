@@ -114,7 +114,8 @@ def claude(cwd, prompt, edit=True):
     while True:
         r = subprocess.run(
             # 読み書きは曲のフォルダ内だけに限定する。指示文や写真に悪意ある文が紛れても外のファイルに触れない。
-            ["claude", "-p", prompt, *tools],
+            # --strict-mcp-config: 利用者が入れている MCP サーバーの道具の説明 (呼び出しごとに数万トークン) を読み込まない
+            ["claude", "-p", prompt, *tools, "--strict-mcp-config"],
             cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1800,
         )
         out = r.stdout + r.stderr
