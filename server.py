@@ -356,7 +356,8 @@ vertical position on the staff (which line or space, how many ledger lines) betw
 accidental, then its note value and dots. Compare rests, ties, clef changes, key and time signatures, repeat
 signs and volta brackets too.
 Ignore differences that do not change what is played: beaming, stem direction, spacing, slurs, dynamics,
-pedal marks, fingering, tempo text, measure numbers, courtesy accidentals, how or where rests are drawn as long as
+pedal marks, fingering, tempo text, measure numbers, courtesy accidentals, ornaments (trills, mordents, turns,
+and accidentals printed above them), arpeggio lines, articulations (staccato, accents, fermatas), how or where rests are drawn as long as
 their total length is the same, a clef change drawn just before versus just after a barline.
 Do not guess: report only differences you can actually see.
 Finish with a line containing only RESULT: followed by a JSON array, one object per difference:
