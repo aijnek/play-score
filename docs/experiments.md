@@ -326,3 +326,16 @@ schoenberg_op19_6 の2小節が印なしの間違いになる (silent 16 → 18)
 正しさは少し上がったが、silent は変わらなかった (Claude の答えの揺れの範囲)。dev で silent が 22 → 16 に減ったのは、
 dev の曲 (dichterliebe2、chopin、bwv269) に多かった、2声部にまたがるタイの読み違いが減ったため。test の曲にはこの種の誤りが少ない。
 test の silent 14 のうち 7 は Verovio 条件の test_clara_trio3、4 は MuseScore 条件の test_clara_polonaise4。
+
+### 19. pick の指示に、A と B で違う音の一覧を書き添える: 採用
+
+pick では、A と B が食い違う小節の番号だけを伝え、どこが違うかは Claude が画像から探していた。
+2つの読みの鳴る音を比べ、「A だけにある音 / B だけにある音」(手、音名、拍、長さ) を小節ごとに文で添えた。
+見る場所を示すだけで、どちらを採るかは写真で決めさせる。pick の段まで (dev、MuseScore 条件) で比べた。
+
+| | 正しい小節 | silent | 印 (うち合っている小節) |
+| --- | --- | --- | --- |
+| 番号だけ | 305 / 348 | 26 | 23 (6) |
+| 違う音の一覧を添える | 310 / 348 | 24 | 14 (0) |
+
+悪化した小節はない。直った小節: chopin_mazurka06_2 8・53、cpebach_h186 3、schubert_lindenbaum 25・26。

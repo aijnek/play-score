@@ -573,11 +573,29 @@ everything that changes what is played: pitches (staff position, ledger lines, a
 values and dots, rests, ties, and which notes sound together. Ignore beaming, stem direction, spacing, slurs, dynamics,
 fingering and how rests are positioned. The rendered halves beam notes beat by beat mechanically; the number of beam
 lines or flags still gives the note value (1 = eighth, 2 = 16th, 3 = 32nd).
+The data says A and B differ in these notes (pitch names ignore enharmonic spelling; beats count from 1, lengths are
+in quarter notes). Use this to know where to look, then decide from the PHOTO:
+{diffs}
 Look at each of those measures note by note, in both hands, in all three bands before you decide.
 Answer "A" or "B" only if that one matches the photo exactly in that measure; answer "neither" if both differ from the
 photo or you cannot tell.
 Finish with a line containing only RESULT: followed by a JSON object mapping each of those measure numbers to
 "A", "B" or "neither", like {{"12": "A", "13": "neither"}}."""
+
+
+def note_diffs(a, b):
+    """2つの読み (root) の音の違いを、小節番号ごとに「A だけ / B だけ」の文にする。"""
+    names = "C C# D D# E F F# G G# A A# B".split()
+    say = lambda e: (f"{'right' if e[0] == 1 else 'left'} hand {names[e[2] % 12]}{e[2] // 12 - 1} at beat {float(e[1]) + 1:g}"
+                     f" lasting {e[3]}")
+    nums = [m.get("number") for m in a.find("part").findall("measure")]
+    out = {}
+    for num, x, y in zip(nums, consensus.events(a), consensus.events(b)):
+        only_a, only_b = Counter(x["ev"]) - Counter(y["ev"]), Counter(y["ev"]) - Counter(x["ev"])
+        if only_a or only_b:
+            out[num] = (f"measure {num}: only in A: " + ("; ".join(map(say, sorted(only_a))) or "nothing")
+                        + ". only in B: " + ("; ".join(map(say, sorted(only_b))) or "nothing") + ".")
+    return out
 
 
 def pick_page(song, n):
@@ -594,10 +612,14 @@ def pick_page(song, n):
                                                  ("B (machine reading B)", copy.deepcopy(alt))], name="pick")
                if s[1] & differ]
 
+    diffs = note_diffs(tree.getroot(), alt)
+
     def ask(system):
         nums = sorted(system[1] & differ, key=int)
+        text = "\n".join(diffs.get(m, f"measure {m}: (no note list)") for m in nums)
         try:
-            got = result(claude(d, PICK.format(image=f"p{n}_pick{system[0]}.png", measures=", ".join(nums)), edit=False))
+            got = result(claude(d, PICK.format(image=f"p{n}_pick{system[0]}.png", measures=", ".join(nums), diffs=text),
+                                edit=False))
         except Exception:
             got = {}
         return {m: got.get(m) if isinstance(got, dict) else None for m in nums}
