@@ -308,3 +308,8 @@ silent 13 のうち 11 は Verovio 条件の test_clara_polonaise4 と test_clar
 
 silent は clara_polonaise3 で1増え dichterliebe2 で1減った。clara_polonaise3 の 22 小節は、前も実際の誤り (シ3 の欠け) ではなく
 別の臨時記号の指摘で偶然印が付いていただけだった。
+
+### 18. 「どちらとも決まらなかった」(pick) の印をやめ、最後の見比べに任せる: 不採用 (数えただけ)
+
+17 の結果で数えた。pick の印をやめると、印は 32 → 15 (合っている小節への印 25 → 10) に減るが、
+schoenberg_op19_6 の2小節が印なしの間違いになる (silent 16 → 18)。印なしの間違いを減らすほうを優先し、入れない。
