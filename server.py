@@ -800,7 +800,7 @@ def second_opinion(d, n, root):
     (d / f"p{n}_alt.musicxml").unlink(missing_ok=True)
     measures = root.find("part").findall("measure")
     (d / f"p{n}_agree.json").write_text(json.dumps([measures[i].get("number") for i in res["agree"]]))
-    if res["alt"]:  # 食い違った小節を Audiveris の読みにしたページ。どちらを採るかは pick_page で決める
+    if res["alt"]:  # 食い違った小節をもう一方の読みにしたページ。どちらを採るかは pick_page で決める
         alt = copy.deepcopy(root)
         measures = alt.find("part").findall("measure")
         for i, m in res["alt"].items():

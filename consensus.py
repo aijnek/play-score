@@ -3,6 +3,7 @@
 2つは別々の方法で読むので、鳴る音が一致した小節はほぼ正しい (試験台の dev で一致した小節の96%が正解)。
 食い違った小節だけを、拍子に合うかどうかや Claude で決める。試験台 (bench.py) の採点も同じ「鳴る音」を使う。
 """
+import copy
 import math
 from collections import Counter
 from fractions import Fraction
@@ -133,7 +134,7 @@ def transplant(dst, src):
 def merge(homr, aud, doubtful=()):
     """homr のページ (root) を土台に、Audiveris (root) と小節ごとに突き合わせる。homr を書き換え、
     {"agree": [小節の並び順], "replaced": [...], "disagree": [...], "alt": {並び順: Audiveris の小節}} を返す。
-    一致しない小節は、homr が拍子に合わず Audiveris が合うときだけ Audiveris の音に入れ替える。
+    一致しない小節は、homr が拍子に合わず Audiveris が合うときだけ Audiveris の音に入れ替え、alt に homr の元の小節を残す。
     それ以外の食い違いは alt に Audiveris の小節 (分解能はそろえ済み) を残し、どちらを採るかは後で決める。
     doubtful (homr の小節の並び順) は、音が同じでも一致とせず disagree に入れる (alt は残さない)。"""
     hp, ap = homr.find("part"), aud.find("part")
@@ -150,6 +151,7 @@ def merge(homr, aud, doubtful=()):
         elif same:
             res["disagree"].append(i)
         elif not fills(hm[i], div, H[i]["time"]) and fills(am[j], div, H[i]["time"]):
+            res["alt"][i] = copy.deepcopy(hm[i])  # 拍子に合うだけで正しいとは限らないので、homr の元の読みも候補に残す
             transplant(hm[i], am[j])
             res["replaced"].append(i)
         else:
