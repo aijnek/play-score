@@ -1,7 +1,7 @@
 """楽譜ソフトが書き出した PDF から、符頭のグリフ (SMuFL) と五線・小節線・弧の座標を読み、データの音符と突き合わせる。
 
 画像からの読み取り (OMR も Claude も) は、加線の多い音や2つの声部が重なる音を同じように読み違える。PDF に文字として
-入っている符頭は座標が正確なので、別の根拠として使える。読めるのは SMuFL の字体で書き出された PDF (MuseScore など) だけで、
+入っている符頭は座標が正確なので、別の根拠として使える。読めるのは SMuFL の字体 (MuseScore など) か、Finale の Maestro と同じ並びの字体 (Kousaku など) で書き出された PDF で、
 スキャンした PDF や他の字体の PDF では小節が取れず、検査を行わない。確かめるのは符頭の種類と高さ、タイの始まる音、臨時記号。音の長さ (旗や連桁の数) は見ない。
 # defer: 8va の記号は見ない (データが実音で、符頭が1オクターブ下に描かれていると食い違いになる)。8va のある楽譜で誤った印が増えたら記号を読む
 """
@@ -15,6 +15,11 @@ import pypdfium2.raw as raw
 HEADS = {0xE0A2: "w", 0xE0A3: "h", 0xE0A4: "q"}  # 全音符・2分音符・黒い符頭
 ACCS = {0xE260: -1, 0xE261: 0, 0xE262: 1, 0xE263: 2, 0xE264: -2}  # フラット・ナチュラル・シャープ・ダブルシャープ・ダブルフラット
 SHARPS, FLATS = "FCGDAEB", "BEADGCF"
+# Finale の Maestro と同じ並びの字体 (Kousaku など) の文字 → SMuFL。pdfium が返す Unicode で引く。
+# 符頭の文字 (œ) が何度も出る字体にだけ当てる (歌詞やコード名の b や n を臨時記号と取り違えないため)
+MAESTRO = {0x153: 0xE0A4, 0x2D9: 0xE0A3, ord("w"): 0xE0A2, ord("#"): 0xE262, ord("b"): 0xE260, ord("n"): 0xE261,
+           0xBA: 0xE264, 0x2039: 0xE263, 0xDC: 0xE263,
+           0x152: 0xE4E5, 0x2030: 0xE4E6, 0x2248: 0xE4E7, 0xAE: 0xE4E8, 0xD3: 0xE4E4, 0x2211: 0xE4E3}  # 休符
 STEPS = "CDEFGAB"
 SIGN = {"G": 4 * 7 + 4, "F": 3 * 7 + 3, "C": 4 * 7}  # 音部記号が示す音 (ト4・ヘ3・ハ4) の全音階上の番号
 
@@ -26,8 +31,9 @@ def pdf_measures(page):
     for o in page.get_objects(filter=[raw.FPDF_PAGEOBJ_PATH], max_depth=3):
         l, b, r, t = o.get_bounds()
         seg = [raw.FPDFPath_GetPathSegment(o.raw, i) for i in range(raw.FPDFPath_CountSegments(o.raw))]
-        if len(seg) == 7 and [raw.FPDFPathSegment_GetType(g) for g in seg[1:]] == [raw.FPDF_SEGMENT_BEZIERTO] * 6:
-            # タイやスラーの弧: 始点から終点へ行って戻る2本の曲線。0番と3番の点が両端
+        kinds = [raw.FPDFPathSegment_GetType(g) for g in seg]
+        if kinds[1:4] == [raw.FPDF_SEGMENT_BEZIERTO] * 3 and kinds.count(raw.FPDF_SEGMENT_BEZIERTO) == 6 and r - l > t - b:
+            # タイやスラーの弧: 始点から終点へ行って戻る2本の曲線 (あいだを直線でつなぐソフトもある)。0番と3番の点が両端
             ends, m = [], o.get_matrix().get()
             for g in (seg[0], seg[3]):
                 x, y = ctypes.c_float(), ctypes.c_float()
@@ -37,13 +43,17 @@ def pdf_measures(page):
             continue
         if t - b < 2 and r - l > 3:  # 五線と加線 (連桁はもっと太い)
             short.append(((b + t) / 2, l, r))
-            if t - b < 1.5:  # 加線は五線より太い
+            if r - l > 30:  # 加線は短い
                 rows[round((b + t) / 2, 1)] += r - l
         elif r - l < 3 and t - b > 20:
             vert.append(((l + r) / 2, b, t))
     if not rows:
         return []
-    ys = sorted(y for y, w in rows.items() if w > max(rows.values()) / 10)  # 五線 (加線は五線より太いので入っていない。最後の段は短いことがある)
+    merged = {}  # 途中で切れた段 (コーダの前など) は、同じ線が少しずれた高さで2本に分かれている
+    for y in sorted(rows):
+        near = next((k for k in merged if abs(k - y) < 1), y)
+        merged[near] = merged.get(near, 0) + rows[y]
+    ys = sorted(y for y, w in merged.items() if w > max(merged.values()) / 10)  # 五線 (加線は短いので入っていない。最後の段は短いことがある)
     staves, i = [], 0
     while i + 4 < len(ys):  # 等間隔に並ぶ5本を五線とする
         gaps = [b - a for a, b in zip(ys[i:i + 5], ys[i + 1:i + 5])]
@@ -62,16 +72,24 @@ def pdf_measures(page):
         buf = ctypes.string_at(raw.FPDFBitmap_GetBuffer(bm), stride * h)
         raw.FPDFBitmap_Destroy(bm)
         return sum(buf[3::4]) / max(w * h, 1)  # アルファ値の平均
+    found, fonts = [], Counter()
     for o in page.get_objects(filter=[raw.FPDF_PAGEOBJ_TEXT], max_depth=3):
-        buf = ctypes.create_string_buffer(16)
+        buf, name, scale = ctypes.create_string_buffer(16), ctypes.create_string_buffer(128), ctypes.c_float()
         k = raw.FPDFTextObj_GetText(o.raw, tp.raw, ctypes.cast(buf, ctypes.POINTER(ctypes.c_ushort)), 8)
-        code = buf.raw[:max(k - 2, 0)].decode("utf-16-le")[:1]  # k は終端を含むバイト数
+        code = buf.raw[:max(k - 2, 0)].decode("utf-16-le", errors="replace")[:1]  # k は終端を含むバイト数
+        raw.FPDFFont_GetBaseFontName(raw.FPDFTextObj_GetFont(o.raw), name, 128)
+        raw.FPDFTextObj_GetFontSize(o.raw, scale)
+        found.append((code and ord(code), name.value, scale.value, o))
+        fonts[name.value] += code == "œ"
+    for code, font, scale, o in found:
+        if fonts[font] >= 5:
+            code = code and MAESTRO.get(code, code)
         l, b, r, t = o.get_bounds()
         m = o.get_matrix().get()
-        size = (round(r - l, 1), round(t - b, 1))
-        if code and ord(code) not in known[size]:
-            known[size][ord(code)] = ink(o)
-        texts.append((code and ord(code), size, round(m[4], 1), round(m[5], 1), m[0], o))
+        size = (font, round(r - l, 1), round(t - b, 1))
+        if code and code not in known[size]:
+            known[size][code] = ink(o)
+        texts.append((code, size, round(m[4], 1), round(m[5], 1), m[0] * scale, o))
     heads, accs, rests = set(), set(), []
     for c, size, x, y, a, o in texts:
         if not c and any(k in HEADS or k in ACCS for k in known[size]):
@@ -107,22 +125,27 @@ def pdf_measures(page):
                 side = over[-1:] if a else under[:1]
         min(side or systems, key=lambda s: max(s[0][0] - y, y - s[1][4], 0))[4].append((k, x, y))
     for low, top, half, bars, mine in systems:
-        ties = []  # タイの始まりの符頭 (x, y)
-        for (x0, y0), (x1, y1) in arcs:
+        cand = []  # (弧の端と符頭の高さの差, 弧の番号, 符頭の x, y)
+        for i, ((x0, y0), (x1, y1)) in enumerate(arcs):
             # 弧の端は符頭のすぐ横か上下にある。両端が同じ高さの符頭に付いていればタイ、段の終わりへ抜ける平らな弧もタイ
             first = [(abs(y - y0), x, y) for k, x, y in mine if x - half < x0 < x + 6 * half and abs(y - y0) < 2 * half]
             last = [y for k, x, y in mine if x - 9 * half < x1 < x + 3 * half and abs(y - y1) < 2 * half]
-            both = [f for f in sorted(first) if any(abs(f[2] - y2) < .3 * half for y2 in last)]
-            if both:
+            out_of_system = x1 > bars[-1] - half and abs(y0 - y1) < half
+            for dy, hx, hy in first:
+                if not (out_of_system or any(abs(hy - y2) < .3 * half for y2 in last)):
+                    continue
                 # 同じ高さの音で始まって終わるスラー (あいだに別の音がある) はタイではない。2つの声部で片方が伸ばすタイも
                 # あいだに音があるが、タイの端は符頭のすぐ脇 (高さの差が線1本半以内) に付く
                 # defer: 1.6 は MuseScore の PDF で測った値 (タイ 1.4〜1.5、スラー 1.8)。他のソフトの PDF でタイの見落としが出たら測り直す
-                hx, hy = both[0][1:]
-                between = any(hx + half < x < x1 - 3 * half and abs(y - hy) < 8 * half for k, x, y in mine)
-                if not (between and abs(y0 - hy) > 1.6 * half):
-                    ties.append((hx, hy))
-            elif first and x1 > bars[-1] - half and abs(y0 - y1) < half:
-                ties.append(min(first)[1:])
+                # (2度の和音で隣にずらして描かれた符頭は、あいだの音に数えない)
+                between = any(hx + 3 * half < x < x1 - 3 * half and abs(y - hy) < 8 * half for k, x, y in mine)
+                if not (between and dy > 1.6 * half):
+                    cand.append((dy, i, hx, hy))
+        ties, used = [], set()  # タイの始まりの符頭 (x, y)。和音では弧が並ぶので、近い組から1つの符頭に1本ずつ当てる
+        for dy, i, hx, hy in sorted(cand):
+            if i not in used and (hx, hy) not in ties:
+                used.add(i)
+                ties.append((hx, hy))
         for a, b in zip(bars, bars[1:]):
             inside = [(k, y) for k, x, y in mine if a - half < x < b - half]
             # 音も休符もない区切り (段の頭から反復記号までなど) は小節ではない
@@ -132,7 +155,9 @@ def pdf_measures(page):
                                if x - 10 * half < ax < x and abs(ay - y) < .3 * half
                                and not any(ax < hx < x and abs(hy - y) < .3 * half for _, hx, hy in mine)), None)
                          for k, x, y in mine if a - half < x < b - half]
-                out.append({"top": top[0], "low": low[0], "half": half, "heads": inside,
+                # 途中で切れた段では、小節のある側の線の高さを使う
+                line = lambda y0: next((y for y, l, r in short if abs(y - y0) < 1 and r - l > 30 and l - 1 < (a + b) / 2 < r + 1), y0)
+                out.append({"top": line(top[0]), "low": line(low[0]), "half": half, "x": [a, b], "heads": inside,
                             "ties": [y for x, y in ties if a - half < x < b - half],
                             "xs": [x for k, x, y in mine if a - half < x < b - half], "marks": marks})
     return out
