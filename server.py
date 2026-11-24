@@ -30,6 +30,7 @@ import numpy as np  # homr の依存として入っている
 from PIL import Image, ImageOps
 
 import consensus
+import glyphs
 from render import LEVELS, compare_images, set_beams
 
 ROOT = Path(__file__).parent
@@ -638,6 +639,12 @@ def pick_page(song, n):
                if s[1] & differ]
 
     diffs = note_diffs(tree.getroot(), alt)
+    # PDF から取り込んだページ: PDF の符頭・タイと片方の読みだけが合う小節は、そちらに決める (Claude に聞かない)
+    sure, bad_a, bad_b = {}, glyph_check(d, n, tree.getroot()), glyph_check(d, n, alt)
+    if bad_a is not None and bad_b is not None:
+        sure = {m: "A" if m in bad_b else "B" for m in differ if (m in bad_a) != (m in bad_b)}
+    differ -= set(sure)
+    systems = [s for s in systems if s[1] & differ]
 
     def ask(system):
         nums = sorted(system[1] & differ, key=int)
@@ -649,17 +656,19 @@ def pick_page(song, n):
             got = {}
         return {m: got.get(m) if isinstance(got, dict) else None for m in nums}
     with ThreadPoolExecutor(6) as pool:
-        choice = {m: c for found in pool.map(ask, systems) for m, c in found.items()}
+        choice = {m: c for found in pool.map(ask, systems) for m, c in found.items()} | sure
     take = {m.get("number"): m for m in alt.find("part").findall("measure") if choice.get(m.get("number")) == "B"}
     for part in tree.getroot().findall("part"):
         for i, m in enumerate(list(part)):
             if m.tag == "measure" and m.get("number") in take:
                 part[i] = take[m.get("number")]
     tree.write(page, encoding="UTF-8", xml_declaration=True)
-    trace(d, n, pick=choice)  # 何を選んだかの記録
+    trace(d, n, pick=choice, pick_glyph=sorted(sure, key=int))  # 何を選んだかの記録
     if take:
         update_meta(song, log={"kind": "proof", "page": n, "text": "2つの読み取りが食い違った第" + "・".join(sorted(take, key=int))
                                + "小節は、写真と見比べて Audiveris の読みを採りました。"})
+    if bad_a is not None:  # PDF の符頭と比べられるページでは、決まらなかった小節に印を付けない (あとで PDF との食い違いに印が付く。
+        return {}          # 決まらなかった小節の印は9割近くが合っている小節に付き、外しても印のない間違いは増えなかった)
     return {m: "2つの読み取りが食い違い、写真と見比べてもどちらとも決まりませんでした"
             for m in differ if choice.get(m) not in ("A", "B")}
 
@@ -681,6 +690,71 @@ def audit_page(song, n):
     with ThreadPoolExecutor(6) as pool:
         found = {m: why for got in pool.map(check, systems) for m, why in got.items()}
     return {m: "最後の見比べで写真と違うと言われました: " + why for m, why in found.items()}
+
+
+def put_back(page, before, numbers):
+    """page (MusicXML のファイル) の numbers の小節を、before (書き換える前の中身) のものに戻す。"""
+    old_root, tree = ET.fromstring(before), ET.parse(page)
+    k = Fraction(int(next(tree.getroot().iter("divisions")).text), int(next(old_root.iter("divisions")).text))
+    old = {m.get("number"): m for m in old_root.iter("measure")}
+    for part in tree.getroot().findall("part"):
+        for i, m in enumerate(list(part)):
+            if m.get("number") in numbers and m.get("number") in old:
+                part[i] = old[m.get("number")]
+                for e in part[i].iter():  # 書き換えで分解能が上がっていれば (連符の長さの書き直し) 合わせる
+                    if e.tag in ("divisions", "duration"):
+                        e.text = str(int(int(e.text) * k))
+    tree.write(page, encoding="UTF-8", xml_declaration=True)
+
+
+def glyph_check(d, n, root=None):
+    """PDF から取り込んだページで、PDF の符頭・タイと root (省略すると p{n}.musicxml) が食い違う小節を {小節番号: 違い} で返す。
+    PDF の符頭が読めていないか、小節の数が合わず比べられなければ None。"""
+    if not (d / f"p{n}_glyphs.json").exists():
+        return None
+    root = ET.parse(d / f"p{n}.musicxml").getroot() if root is None else root
+    return glyphs.check(json.loads((d / f"p{n}_glyphs.json").read_text()), root.find("part"))
+
+
+def glyph_page(song, n):
+    """PDF から取り込んだページなら、PDF に文字として入っている符頭とタイの弧 (p{n}_glyphs.json) をデータと比べる。
+    食い違う小節は、違いを伝えて Claude に直させ、直したあとも食い違う小節は元に戻して {小節番号: 理由} で返す。"""
+    d = LIB / song
+    page = d / f"p{n}.musicxml"
+    look = lambda: glyph_check(d, n)
+    bad = look()
+    if not bad:
+        return {}
+    update_meta(song, step={"phase": "glyph", "page": n})
+    before = page.read_bytes()
+    listing = "\n".join(f"measure {m}: {why}" for m, why in sorted(bad.items(), key=lambda x: int(x[0])))
+    try:
+        claude_edit(d, page, f"""p{n}.musicxml is machine-read piano sheet music (measure numbers are the `number` attributes).
+The page came from a PDF, and the noteheads and tie arcs stored in the PDF itself were compared with the data. That
+comparison is exact about which noteheads and ties are printed (it does not see note lengths, rests or accidentals).
+In these measures the data does not match the print:
+{listing}
+Pitch names above are read from the staff position with the clef in force at the start of the measure and carry no
+accidentals; a notehead "printed but not in the data" together with one "in the data but not printed" on the same staff
+usually means that note has the wrong pitch or the wrong note value (hollow = half note, filled = quarter or shorter).
+Two voices may print one shared notehead, or two noteheads side by side at the same pitch.
+For each listed measure look at p{n}_sK.jpg (zoomed photo of system K, top to bottom) and correct the measure in
+p{n}.musicxml so that its noteheads and ties match the print. Change only the listed measures.
+{RULES}
+Reply with one short line.""")
+        left = look()
+    except Exception:
+        left = None
+    if left is None:  # 直せなかったか、小節の数が変わった: 全部元に戻す
+        page.write_bytes(before)
+        left = bad
+    fixed = sorted(set(bad) - set(left), key=int)
+    # 直して合うようになった小節だけを残す。頼んでいない小節の書き換え (隣の小節のタイの受け側など) も戻す
+    put_back(page, before, {m.get("number") for m in ET.fromstring(before).iter("measure")} - set(fixed))
+    trace(d, n, glyph_fixed=fixed)
+    if fixed:
+        update_meta(song, log={"kind": "proof", "page": n, "text": "PDF の符頭・タイと食い違っていた第" + "・".join(fixed) + "小節を直しました。"})
+    return {m: "PDF の符頭かタイと食い違っています" for m in look() or bad}
 
 
 def keep_agreed(d, n, before):
@@ -712,7 +786,7 @@ def keep_agreed(d, n, before):
     return kept
 
 
-STEPS = ("pick", "proof", "verify", "audit", "beam")
+STEPS = ("pick", "proof", "verify", "audit", "glyph", "beam")
 
 
 def proof_page(song, n, steps=STEPS):
@@ -744,12 +818,22 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
     # pick: 2つの読み取りが食い違った小節を先に決める。決まらなかった小節は、校正と見比べのあとも印を残す
     # audit: 見比べの見落としを、もう1回の見比べで拾って印にする
     run = {"pick": lambda: pick_page(song, n), "proof": proof, "verify": lambda: verify_page(song, n),
-           "audit": lambda: audit_page(song, n)}
+           "audit": lambda: audit_page(song, n), "glyph": lambda: glyph_page(song, n)}
     for step in steps:
-        if step not in run:
+        # PDF の符頭と比べられるページでは、最後の見比べをしない。その印の9割近くは合っている小節に付き、
+        # 間違いに付いた印は PDF との食い違いの印と重なっていた
+        if step not in run or (step == "audit" and glyph_check(d, n) is not None):
             continue
+        before = page.read_bytes()
         try:
             flags = run[step]()
+            if step in ("proof", "verify"):
+                # PDF の符頭・タイと合っていた小節を、校正や見比べの直しが食い違う形に書き換えていたら元に戻す
+                # (試験台の2回の測定で7小節あり、どれも書き換える前が正しかった)
+                was, now = glyph_check(d, n, ET.fromstring(before)), glyph_check(d, n)
+                if was is not None and now is not None and set(now) - set(was):
+                    put_back(page, before, set(now) - set(was))
+                    trace(d, n, **{f"glyph_kept_{step}": sorted(set(now) - set(was), key=int)})
         except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
             update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
             if step == "pick":
@@ -998,7 +1082,7 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/":
             return self.reply(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
         # id は自前で発行した16進のみ受け付ける (パストラバーサル防止)
-        m = re.fullmatch(r"/api/songs(?:/([0-9a-f]{12})(?:/(pages|score|fix)(?:/(\d+)(/proof)?)?)?)?", path)
+        m = re.fullmatch(r"/api/songs(?:/([0-9a-f]{12})(?:/(pages|score|fix|pdf)(?:/(\d+)(/proof)?)?)?)?", path)
         if not m:
             return self.reply(404, {"error": "not found"})
         song, sub, page, proof = m.groups()
@@ -1039,6 +1123,9 @@ class Handler(BaseHTTPRequestHandler):
             if not f.exists():
                 return self.reply(404, {"error": "ページがありません"})
             return self.reply(200, f.read_bytes(), "image/jpeg", "max-age=31536000, immutable")  # 写真は差し替わらない
+        if sub == "pdf" and method == "POST":  # このあとに送られてくるページの元の PDF。符頭を文字として読むのに使う
+            (d / "src.pdf").write_bytes(self.body())
+            return self.reply(200, {})
         if sub == "pages" and method == "POST":
             try:
                 im = ImageOps.exif_transpose(open_image(self.body())).convert("RGB")
@@ -1049,6 +1136,10 @@ class Handler(BaseHTTPRequestHandler):
                 n = meta["pages"] = meta["pages"] + 1
                 (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
             im.save(d / f"p{n}.jpg", quality=92)
+            src = re.fullmatch(r"pdf=(\d+)", self.path.partition("?")[2])  # 直前に送られた PDF の何ページ目か
+            found = glyphs.read_pdf(d / "src.pdf", int(src[1])) if src and (d / "src.pdf").exists() else []
+            if found:
+                (d / f"p{n}_glyphs.json").write_text(json.dumps(found))
             enqueue(song, "page", n)
             return self.reply(200, read_meta(song))
         if sub == "fix" and method == "POST":

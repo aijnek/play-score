@@ -6,7 +6,7 @@ bench/truth/*.musicxml (正解。make_truth.py で作る) を PDF と同じき�
   uv run python bench.py full --yes-full  Claude を使う本番どおりの処理 (サブスクリプションを使う)
   uv run python bench.py --selftest       採点そのものの検算
   --piece=名前 (繰り返し可) で曲を、--cond=verovio|musescore で描き方を絞る。--test で test_ の曲も測る。--label=名前 で結果の名前を付ける
-  --from=名前:段 で、その名前の run の結果を引き継ぎ、段 (pick|proof|verify|audit) から後ろだけをやり直す (--label は別の名前にする)
+  --from=名前:段 で、その名前の run の結果を引き継ぎ、段 (pick|proof|verify|audit|glyph) から後ろだけをやり直す (--label は別の名前にする)
     例: uv run python bench.py full --yes-full --from=base:audit --label=audit2   最後の見比べだけをやり直して比べる
 途中のデータは bench/work/runs/<名前>/<曲>_<条件>/ に残る。連桁の読み取りは採点しないので行わない。
 """
@@ -31,6 +31,7 @@ import resvg_py
 import verovio
 from PIL import Image
 
+import glyphs
 import server
 from consensus import align, events
 
@@ -39,7 +40,7 @@ TRUTH, WORK = BENCH / "truth", BENCH / "work"
 WIDTH = 2000  # アプリ (index.html) が PDF のページを画像にするときの横幅。JPEG の品質 0.92 も合わせる
 FONTS = ("Leland", "Bravura", "Gootville", "Leipzig")  # Verovio で描くときの字体。曲ごとに替え、PDF を作るソフトの違いに近づける
 MSCORE = "/Applications/MuseScore 4.app/Contents/MacOS/mscore"  # brew install --cask musescore
-STAGES = {"raw": (), "pick": ("pick",), "full": ("pick", "proof", "verify", "audit")}  # 段階ごとに行う処理 (server.STEPS)
+STAGES = {"raw": (), "pick": ("pick",), "full": ("pick", "proof", "verify", "audit", "glyph")}  # 段階ごとに行う処理 (server.STEPS)
 POINTS = ("omr", *STAGES["full"])  # 途中のデータが残る時点
 CONDS = ("verovio", "musescore")
 NAMES = "C C# D D# E F F# G G# A A# B".split()
@@ -59,6 +60,8 @@ def engrave(name):
         done = sorted(out.glob("p*.jpg"))
         if done and min(f.stat().st_mtime for f in done) > src:  # 正解が変わっていなければ描き直さない
             pages[cond] = len(done)
+            if cond == "musescore" and not list(out.glob("p*_glyphs.json")):  # 画像だけ作ってあるとき: 同じ PDF をもう一度書き出して符頭を読む
+                musescore_pages(name)
             continue
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir(parents=True)
@@ -89,8 +92,11 @@ def musescore_pages(name):
     else:
         raise SystemExit(f"{name}: MuseScore で PDF にできなかった")
     doc = pypdfium2.PdfDocument(str(pdf))
-    ims = [p.render(scale=WIDTH / p.get_size()[0]).to_pil().convert("RGB") for p in doc]
-    ims = [im for im in ims if np.asarray(im.convert("L")).min() < 128]  # 白紙のページ (MuseScore がときどき出す) は除く
+    ims = [(p, p.render(scale=WIDTH / p.get_size()[0]).to_pil().convert("RGB")) for p in doc]
+    ims = [(p, im) for p, im in ims if np.asarray(im.convert("L")).min() < 128]  # 白紙のページ (MuseScore がときどき出す) は除く
+    for n, (p, _) in enumerate(ims, 1):  # アプリが PDF を取り込むときと同じく、PDF の中の符頭も読んでおく
+        (pdf.parent / f"p{n}_glyphs.json").write_text(json.dumps(glyphs.pdf_measures(p)))
+    ims = [im for _, im in ims]
     doc.close()
     pdf.unlink()
     return ims
@@ -237,6 +243,8 @@ def read_song(name, cond, steps, src=None):
     pages = sorted((WORK / "pages" / song).glob("p*.jpg"), key=lambda p: int(p.stem[1:]))
     if src:
         shutil.copytree(src, d)
+        for f in (WORK / "pages" / song).glob("p*_glyphs.json"):  # 元の run より後に足した検査の材料
+            shutil.copy(f, d)
         (d / "score.musicxml").unlink(missing_ok=True)
         (d / "meta.json").write_text(json.dumps({**json.loads((d / "meta.json").read_text()), "id": song, "flags": {}, "log": []}))
         earlier = POINTS[:POINTS.index(steps[0])]
@@ -249,7 +257,7 @@ def read_song(name, cond, steps, src=None):
             shutil.copy(last_point(d, n, earlier), d / f"p{n}.musicxml")
             t = json.loads((d / f"p{n}_trace.json").read_text()) if (d / f"p{n}_trace.json").exists() else {}
             t["flags"] = {st: f for st, f in t.get("flags", {}).items() if st in earlier}
-            for st, key in (("pick", "pick"), ("proof", "kept"), ("verify", "reverted")):
+            for st, key in (("pick", "pick"), ("pick", "pick_glyph"), ("proof", "kept"), ("verify", "reverted")):
                 if st not in earlier:
                     t.pop(key, None)
             (d / f"p{n}_trace.json").write_text(json.dumps(t, ensure_ascii=False))
@@ -261,6 +269,8 @@ def read_song(name, cond, steps, src=None):
     d.mkdir(parents=True)
     for p in pages:
         shutil.copy(p, d / p.name)
+        if p.with_name(f"{p.stem}_glyphs.json").exists():
+            shutil.copy(p.with_name(f"{p.stem}_glyphs.json"), d)
     (d / "meta.json").write_text(json.dumps({"id": song, "title": song, "pages": len(pages), "measures": 0, "pending": 0,
                                              "step": None, "log": []}))
     for n in range(1, len(pages) + 1):
@@ -306,7 +316,8 @@ def judge(truth, d):
             for m in t.get(kind, []):
                 cls[m] = kind
         for m, c in pick.items():
-            cls[m] = ("replaced " if cls.get(m) == "replaced" else "pick ") + str(c if c in ("A", "B") else "neither")
+            cls[m] = (("replaced " if cls.get(m) == "replaced" else "pick ") + str(c if c in ("A", "B") else "neither")
+                      + (" (PDF)" if m in t.get("pick_glyph", []) else ""))
         for st, f in t.get("flags", {}).items():
             for m in f:
                 by.setdefault(m, []).append(st)
@@ -473,7 +484,7 @@ def main(argv):
     if not stages or not pieces:
         raise SystemExit(__doc__)
     if src and (not label or label == src or start not in POINTS[1:] or not (WORK / "runs" / src).exists()):
-        raise SystemExit("--from=名前:段 は、bench/work/runs にある run の名前と pick|proof|verify|audit、それと別の --label が要る")
+        raise SystemExit("--from=名前:段 は、bench/work/runs にある run の名前と pick|proof|verify|audit|glyph、それと別の --label が要る")
     pages = {p: engrave(p) for p in pieces}
     if any(STAGES[s] for s in stages):
         n = sum(pages[p][c] for p in pieces for c in conds)
