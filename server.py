@@ -57,6 +57,7 @@ MAX_UPLOAD = 40 * 1024 * 1024
 
 jobs: queue.Queue = queue.Queue()  # OMRは重いので1本ずつ直列に処理する
 lock = threading.Lock()
+spent = Counter()  # Claude の呼び出しの回数とトークン数 (起動してからの合計)
 
 
 # ---------- ライブラリ (library/<id>/meta.json) ----------
@@ -73,6 +74,16 @@ def update_meta(song, log=None, **kw):
             meta["log"] = (meta["log"] + [log])[-50:]
         (LIB / song / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
         return meta
+
+
+def trace(d, n, **kw):
+    """ページ n の各小節がどの処理を通ったかを p{n}_trace.json に足す。試験台が、どの段が直しどの段が壊したかを数えるのに使う。
+    flags は {段の名前: {小節番号: 理由}} で、段ごとに足す。"""
+    f = d / f"p{n}_trace.json"
+    with lock:
+        t = json.loads(f.read_text()) if f.exists() else {}
+        t["flags"] = {**t.get("flags", {}), **kw.pop("flags", {})}
+        f.write_text(json.dumps({**t, **kw}, ensure_ascii=False))
 
 
 def enqueue(song, *job):
@@ -115,13 +126,21 @@ def claude(cwd, prompt, edit=True):
         r = subprocess.run(
             # 読み書きは曲のフォルダ内だけに限定する。指示文や写真に悪意ある文が紛れても外のファイルに触れない。
             # --strict-mcp-config: 利用者が入れている MCP サーバーの道具の説明 (呼び出しごとに数万トークン) を読み込まない
-            ["claude", "-p", prompt, *tools, "--strict-mcp-config"],
+            # --safe-mode --disable-slash-commands: 利用者の CLAUDE.md・スキル・プラグイン・フックも読み込まない
+            # (画像1枚を読む呼び出しで約1万7千 → 約1万トークン。利用者の指示が校正の判断に混ざることも防ぐ)
+            ["claude", "-p", prompt, *tools, "--strict-mcp-config", "--safe-mode", "--disable-slash-commands",
+             "--output-format", "json"],
             cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1800,
         )
         out = r.stdout + r.stderr
+        try:
+            res = json.loads(r.stdout)
+        except ValueError:
+            res = {}
+        failed = r.returncode or res.get("is_error")
         if "Not logged in" in out:
             raise RuntimeError("Claude Code にログインしていません。ターミナルで claude を起動して /login を実行してください")
-        reset = limit_reset(out) if r.returncode else None
+        reset = limit_reset(out) if failed else None
         if not reset:
             break
         # 解除直後は混むので少し余裕を置く。予定より早く解除されることもあるので、10分ごとに呼び直して確かめる
@@ -132,9 +151,13 @@ def claude(cwd, prompt, edit=True):
         while time.time() < until:  # まとめて待つと、Mac がスリープした時間のぶん遅れる
             time.sleep(30)
         update_meta(cwd.name, step=step)
-    if r.returncode:
-        raise RuntimeError(out.strip()[-300:] or "claude が失敗しました")
-    return r.stdout.strip()
+    if failed or "result" not in res:
+        raise RuntimeError(str(res.get("result") or out).strip()[-300:] or "claude が失敗しました")
+    u = res.get("usage") or {}
+    with lock:  # 試験台が策ごとの費用を比べるための記録
+        spent.update(calls=1, usd=res.get("total_cost_usd") or 0, output=u.get("output_tokens", 0),
+                     input=sum(u.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")))
+    return res["result"].strip()
 
 
 NOTE_DIV = {"whole": 1, "half": 2, "quarter": 4, "eighth": 8, "16th": 16, "32nd": 32, "64th": 64, "128th": 128}
@@ -377,7 +400,7 @@ def verify_page(song, n):
     確かめきれなかった小節を {小節番号: 理由} で返す。"""
     d = LIB / song
     page = d / f"p{n}.musicxml"
-    todo, flags, before = None, {}, None
+    todo, flags, before, undone = None, {}, None, set()
     for attempt in (1, 2, 3, 4):
         update_meta(song, step={"phase": "verify", "page": n, "round": attempt})
         systems = compare_images(d, n)
@@ -401,6 +424,8 @@ def verify_page(song, n):
                         part[i] = old[m.get("number")]
             tree.write(page, encoding="UTF-8", xml_declaration=True)
             flags |= {m: "直しを試みましたが、見比べ直しても写真と合わなかったので、直す前に戻しました" for m in still}
+            undone |= still
+            trace(d, n, reverted=sorted(undone, key=int))
             update_meta(song, log={"kind": "proof", "page": n, "text": "見比べ直して合わなかった直しを取り消しました: 第"
                                    + "・".join(sorted(still, key=int)) + "小節"})
             found = [f for f in found if str(f["measure"]) not in still]
@@ -631,8 +656,7 @@ def pick_page(song, n):
             if m.tag == "measure" and m.get("number") in take:
                 part[i] = take[m.get("number")]
     tree.write(page, encoding="UTF-8", xml_declaration=True)
-    with open(d / f"p{n}_pick.jsonl", "a") as f:  # 何を選んだかの記録
-        f.write(json.dumps(choice) + "\n")
+    trace(d, n, pick=choice)  # 何を選んだかの記録
     if take:
         update_meta(song, log={"kind": "proof", "page": n, "text": "2つの読み取りが食い違った第" + "・".join(sorted(take, key=int))
                                + "小節は、写真と見比べて Audiveris の読みを採りました。"})
@@ -688,20 +712,20 @@ def keep_agreed(d, n, before):
     return kept
 
 
-def proof_page(song, n):
-    """p{n}.musicxml を写真と照合して直し、描き直して見比べる。Claude が使えなくても例外は出さない。"""
+STEPS = ("pick", "proof", "verify", "audit", "beam")
+
+
+def proof_page(song, n, steps=STEPS):
+    """p{n}.musicxml を写真と照合して直し、描き直して見比べる。Claude が使えなくても例外は出さない。
+    steps に挙げた段だけを行う (試験台が途中の段からやり直すのに使う)。段が終わるごとに、その時点のデータを
+    p{n}_at_<段>.musicxml に、付けた印を p{n}_trace.json に残す。"""
     d = LIB / song
     page = d / f"p{n}.musicxml"
     strips = [f"p{n}_s{k}.jpg" for k in range(1, cut_systems(d, n) + 1)]
-    try:  # 2つの読み取りが食い違った小節を先に決める。決まらなかった小節は、校正と見比べのあとも印を残す
-        unsure = pick_page(song, n)
-    except Exception as e:
-        unsure = {}
-        update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
-    update_meta(song, flags={**read_meta(song).get("flags", {}), **unsure})
-    update_meta(song, step={"phase": "proof", "page": n})
-    before = page.read_bytes()
-    try:
+
+    def proof():
+        update_meta(song, step={"phase": "proof", "page": n})
+        before = page.read_bytes()
         summary = claude_edit(d, page, f"""You are proofreading optical music recognition (OMR) output for a piano score.
 - p{n}.jpg is the photographed page. {", ".join(strips)} are zoomed crops of each system, top to bottom.
 - p{n}.musicxml is the OMR result for this page. A <print new-system="yes"/> marks the first measure of each new system.
@@ -712,19 +736,33 @@ If a metronome mark or tempo word is printed, make sure the first measure has <d
 {REPLY}""")
         update_meta(song, log={"kind": "proof", "page": n, "text": summary})
         kept = keep_agreed(d, n, before)
+        trace(d, n, kept=kept)
         if kept:
             update_meta(song, log={"kind": "proof", "page": n, "text": "2つの読み取りが一致していた第" + "・".join(kept)
                                    + "小節は、校正での書き換えを取り消しました。"})
-        flags = verify_page(song, n)
-        flags = {**audit_page(song, n), **flags}  # 見比べの見落としを、もう1回の見比べで拾って印にする
-        update_meta(song, flags={**read_meta(song).get("flags", {}), **flags})
-    except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
-        update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
-    # 連桁は音が確定してから読む。校正で音が変わると番号がずれるため
-    update_meta(song, step={"phase": "beam", "page": n})
-    tree = ET.parse(page)
-    add_beams(d, n, tree.getroot().find("part").findall("measure"))
-    tree.write(page, encoding="UTF-8", xml_declaration=True)
+        return {}
+    # pick: 2つの読み取りが食い違った小節を先に決める。決まらなかった小節は、校正と見比べのあとも印を残す
+    # audit: 見比べの見落としを、もう1回の見比べで拾って印にする
+    run = {"pick": lambda: pick_page(song, n), "proof": proof, "verify": lambda: verify_page(song, n),
+           "audit": lambda: audit_page(song, n)}
+    for step in steps:
+        if step not in run:
+            continue
+        try:
+            flags = run[step]()
+        except Exception as e:  # Claude が使えなくても、そこまでの結果で先へ進む
+            update_meta(song, log={"kind": "skip", "page": n, "text": str(e)})
+            if step == "pick":
+                continue
+            break
+        update_meta(song, flags={**flags, **read_meta(song).get("flags", {})})  # 理由は先に付いたものを残す
+        trace(d, n, flags={step: flags})
+        shutil.copy(page, d / f"p{n}_at_{step}.musicxml")
+    if "beam" in steps:  # 連桁は音が確定してから読む。校正で音が変わると番号がずれるため
+        update_meta(song, step={"phase": "beam", "page": n})
+        tree = ET.parse(page)
+        add_beams(d, n, tree.getroot().find("part").findall("measure"))
+        tree.write(page, encoding="UTF-8", xml_declaration=True)
 
 
 def spots(part):
@@ -781,7 +819,8 @@ def borrow_ties(homr, aud):
 
 def second_opinion(d, n, root):
     """Audiveris でも読み、homr の結果 (root) と小節ごとに突き合わせる。root を書き換え、知らせる文を返す (なければ None)。"""
-    (d / f"p{n}_agree.json").unlink(missing_ok=True)
+    for f in (f"p{n}_agree.json", f"p{n}_alt.json", f"p{n}_alt.musicxml", f"p{n}_trace.json"):  # 前回の読み取りの残り
+        (d / f).unlink(missing_ok=True)
     if not Path(AUDIVERIS).exists():
         return None
     out = d / "audiveris"
@@ -797,9 +836,10 @@ def second_opinion(d, n, root):
         slurs_to_ties(aud.find("part"))
         borrowed = borrow_ties(root, aud)
     res = consensus.merge(root, aud, borrowed)
-    (d / f"p{n}_alt.musicxml").unlink(missing_ok=True)
     measures = root.find("part").findall("measure")
     (d / f"p{n}_agree.json").write_text(json.dumps([measures[i].get("number") for i in res["agree"]]))
+    trace(d, n, **{k: [measures[i].get("number") for i in v] for k, v in
+                   (("agree", res["agree"]), ("replaced", res["replaced"]), ("differ", res["disagree"]), ("borrowed", sorted(borrowed)))})
     if res["alt"]:  # 食い違った小節をもう一方の読みにしたページ。どちらを採るかは pick_page で決める
         alt = copy.deepcopy(root)
         measures = alt.find("part").findall("measure")
@@ -837,10 +877,16 @@ def process_page(song, n):
     tree.write(page, encoding="UTF-8", xml_declaration=True)
     if agreed:
         update_meta(song, log={"kind": "proof", "page": n, "text": agreed})
+    shutil.copy(page, d / f"p{n}_at_omr.musicxml")
 
     proof_page(song, n)
+    append_page(song, n)
 
-    # 曲全体の score.musicxml の末尾にこのページの小節を足し、小節番号を 1..N に振り直す
+
+def append_page(song, n):
+    """曲全体の score.musicxml の末尾にページ n の小節を足し、小節番号を 1..N に振り直す。"""
+    d = LIB / song
+    score, page = d / "score.musicxml", d / f"p{n}.musicxml"
     if score.exists():
         tree, new = ET.parse(score), ET.parse(page)
         for part, new_part in zip(tree.getroot().findall("part"), new.getroot().findall("part")):
