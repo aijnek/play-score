@@ -1060,6 +1060,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "homr" },
+    { name = "pypdfium2" },
     { name = "resvg-py" },
     { name = "verovio" },
 ]
@@ -1067,21 +1068,18 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "music21" },
-    { name = "pypdfium2" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "homr", specifier = ">=0.7.1" },
+    { name = "pypdfium2", specifier = ">=5.15.2" },
     { name = "resvg-py", specifier = ">=0.5.0" },
     { name = "verovio", specifier = ">=6.4.1" },
 ]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "music21", specifier = ">=10.5.2" },
-    { name = "pypdfium2", specifier = ">=5.15.2" },
-]
+dev = [{ name = "music21", specifier = ">=10.5.2" }]
 
 [[package]]
 name = "pyclipper"

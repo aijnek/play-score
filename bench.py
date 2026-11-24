@@ -6,6 +6,9 @@ bench/truth/*.musicxml (正解。make_truth.py で作る) を PDF と同じき�
   uv run python bench.py full --yes-full  Claude を使う本番どおりの処理 (サブスクリプションを使う)
   uv run python bench.py --selftest       採点そのものの検算
   --piece=名前 (繰り返し可) で曲を、--cond=verovio|musescore で描き方を絞る。--test で test_ の曲も測る。--label=名前 で結果の名前を付ける
+  --from=名前:段 で、その名前の run の結果を引き継ぎ、段 (pick|proof|verify|audit|glyph) から後ろだけをやり直す (--label は別の名前にする)
+    例: uv run python bench.py full --yes-full --from=base:audit --label=audit2   最後の見比べだけをやり直して比べる
+途中のデータは bench/work/runs/<名前>/<曲>_<条件>/ に残る。連桁の読み取りは採点しないので行わない。
 """
 import importlib.metadata
 import io
@@ -28,6 +31,7 @@ import resvg_py
 import verovio
 from PIL import Image
 
+import glyphs
 import server
 from consensus import align, events
 
@@ -36,7 +40,8 @@ TRUTH, WORK = BENCH / "truth", BENCH / "work"
 WIDTH = 2000  # アプリ (index.html) が PDF のページを画像にするときの横幅。JPEG の品質 0.92 も合わせる
 FONTS = ("Leland", "Bravura", "Gootville", "Leipzig")  # Verovio で描くときの字体。曲ごとに替え、PDF を作るソフトの違いに近づける
 MSCORE = "/Applications/MuseScore 4.app/Contents/MacOS/mscore"  # brew install --cask musescore
-STAGES = ("raw", "pick", "full")
+STAGES = {"raw": (), "pick": ("pick",), "full": ("pick", "proof", "verify", "audit", "glyph")}  # 段階ごとに行う処理 (server.STEPS)
+POINTS = ("omr", *STAGES["full"])  # 途中のデータが残る時点
 CONDS = ("verovio", "musescore")
 NAMES = "C C# D D# E F F# G G# A A# B".split()
 
@@ -55,6 +60,8 @@ def engrave(name):
         done = sorted(out.glob("p*.jpg"))
         if done and min(f.stat().st_mtime for f in done) > src:  # 正解が変わっていなければ描き直さない
             pages[cond] = len(done)
+            if cond == "musescore" and not list(out.glob("p*_glyphs.json")):  # 画像だけ作ってあるとき: 同じ PDF をもう一度書き出して符頭を読む
+                musescore_pages(name)
             continue
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir(parents=True)
@@ -85,8 +92,11 @@ def musescore_pages(name):
     else:
         raise SystemExit(f"{name}: MuseScore で PDF にできなかった")
     doc = pypdfium2.PdfDocument(str(pdf))
-    ims = [p.render(scale=WIDTH / p.get_size()[0]).to_pil().convert("RGB") for p in doc]
-    ims = [im for im in ims if np.asarray(im.convert("L")).min() < 128]  # 白紙のページ (MuseScore がときどき出す) は除く
+    ims = [(p, p.render(scale=WIDTH / p.get_size()[0]).to_pil().convert("RGB")) for p in doc]
+    ims = [(p, im) for p, im in ims if np.asarray(im.convert("L")).min() < 128]  # 白紙のページ (MuseScore がときどき出す) は除く
+    for n, (p, _) in enumerate(ims, 1):  # アプリが PDF を取り込むときと同じく、PDF の中の符頭も読んでおく
+        (pdf.parent / f"p{n}_glyphs.json").write_text(json.dumps(glyphs.pdf_measures(p)))
+    ims = [im for _, im in ims]
     doc.close()
     pdf.unlink()
     return ims
@@ -180,7 +190,7 @@ def score(truth, result, flags=()):
     n["silent"] = sum(not ok and i not in flagged for i, ok in enumerate(right))
     n["false_flags"] = sum(ok and i in flagged for i, ok in enumerate(right))
     n["truth_notes"] = sum(len(t["ev"]) for t in T)
-    return {"n": n, "right": right, "wrong": sorted(wrong, key=lambda w: w.get("measure", 10 ** 6))}
+    return {"n": n, "right": right, "wrong": sorted(wrong, key=lambda w: w.get("measure", 10 ** 6)), "pairs": pairs}
 
 
 # ---------- 読み取り ----------
@@ -223,16 +233,44 @@ def cached_run(real, cache):
     return run
 
 
-def read_song(name, cond, stage):
-    """画像の並びを、隔離したライブラリの1曲として server.process_page に1ページずつ通し、(score.musicxml の root, 印の付いた小節) を返す。
+def read_song(name, cond, steps, src=None):
+    """画像の並びを、隔離したライブラリの1曲として server.process_page に1ページずつ通し、曲のフォルダを返す。
+    src (別の run の曲のフォルダ) があれば、その結果を写し、steps より前の段はやり直さずに steps だけを行う。
     server の差し替えは patched() の中で行う。"""
-    song = f"{name}_{cond}_{stage}"
-    d = WORK / "lib" / song
+    song = f"{name}_{cond}"
+    d = server.LIB / song
     shutil.rmtree(d, ignore_errors=True)
+    pages = sorted((WORK / "pages" / song).glob("p*.jpg"), key=lambda p: int(p.stem[1:]))
+    if src:
+        shutil.copytree(src, d)
+        for f in (WORK / "pages" / song).glob("p*_glyphs.json"):  # 元の run より後に足した検査の材料
+            shutil.copy(f, d)
+        (d / "score.musicxml").unlink(missing_ok=True)
+        (d / "meta.json").write_text(json.dumps({**json.loads((d / "meta.json").read_text()), "id": song, "flags": {}, "log": []}))
+        earlier = POINTS[:POINTS.index(steps[0])]
+        for n in range(1, len(pages) + 1):
+            if not (d / f"p{n}_at_omr.musicxml").exists():
+                continue  # 元の run で読み取れなかったページ
+            for st in POINTS:  # やり直す段の結果を消し、その手前の時点のデータに戻す
+                if st not in earlier:
+                    (d / f"p{n}_at_{st}.musicxml").unlink(missing_ok=True)
+            shutil.copy(last_point(d, n, earlier), d / f"p{n}.musicxml")
+            t = json.loads((d / f"p{n}_trace.json").read_text()) if (d / f"p{n}_trace.json").exists() else {}
+            t["flags"] = {st: f for st, f in t.get("flags", {}).items() if st in earlier}
+            for st, key in (("pick", "pick"), ("pick", "pick_glyph"), ("proof", "kept"), ("verify", "reverted")):
+                if st not in earlier:
+                    t.pop(key, None)
+            (d / f"p{n}_trace.json").write_text(json.dumps(t, ensure_ascii=False))
+            server.update_meta(song, flags={m: why for f in t["flags"].values() for m, why in f.items()}
+                               | server.read_meta(song).get("flags", {}))
+            server.proof_page(song, n)
+            server.append_page(song, n)
+        return d
     d.mkdir(parents=True)
-    pages = sorted((WORK / "pages" / f"{name}_{cond}").glob("p*.jpg"), key=lambda p: int(p.stem[1:]))
     for p in pages:
         shutil.copy(p, d / p.name)
+        if p.with_name(f"{p.stem}_glyphs.json").exists():
+            shutil.copy(p.with_name(f"{p.stem}_glyphs.json"), d)
     (d / "meta.json").write_text(json.dumps({"id": song, "title": song, "pages": len(pages), "measures": 0, "pending": 0,
                                              "step": None, "log": []}))
     for n in range(1, len(pages) + 1):
@@ -240,29 +278,68 @@ def read_song(name, cond, stage):
             server.process_page(song, n)
         except RuntimeError as e:  # 読み取れなかったページは、そのページの小節がすべて欠けたものとして数える
             print(f"{song} p{n}: {str(e)[:80]}", flush=True)
+    return d
+
+
+def last_point(d, n, points):
+    """ページ n の、points のうち最後に残っている時点のデータ (段が失敗すると、その時点のデータは残らない)。"""
+    return next(f for f in (d / f"p{n}_at_{st}.musicxml" for st in reversed(points)) if f.exists())
+
+
+def judge(truth, d):
+    """曲のフォルダ d の結果を採点する。score() の結果に、小節ごとの来歴 "measures" を足して返す:
+    [{"m": 正解の小節, "r": 結果の小節番号, "right", "class": 2つの読み取りの突き合わせと pick の結果,
+      "flags": [印を付けた段], "at": {時点: その時点で合っていたか}}]"""
     if not (d / "score.musicxml").exists():
-        return ET.fromstring("<score-partwise><part id='P1'/></score-partwise>"), set()
-    return ET.parse(d / "score.musicxml").getroot(), set(server.read_meta(song).get("flags", {}))
+        root, flags = ET.fromstring("<score-partwise><part id='P1'/></score-partwise>"), {}
+    else:
+        root, flags = ET.parse(d / "score.musicxml").getroot(), server.read_meta(d.name).get("flags", {})
+    res = score(truth, root, set(flags))
+    pages = sorted({int(f.name[1:].split("_")[0]) for f in d.glob("p*_at_omr.musicxml")})
+    at = {}
+    for i, st in enumerate(POINTS):  # 各時点のデータをページ順につないで採点する
+        if not any((d / f"p{n}_at_{st}.musicxml").exists() for n in pages):
+            continue
+        whole = None
+        for n in pages:
+            r = ET.parse(last_point(d, n, POINTS[:i + 1])).getroot()
+            if whole is None:
+                whole = r
+            else:
+                whole.find("part").extend(r.find("part").findall("measure"))
+        at[st] = score(truth, whole)["right"]
+    cls, by = {}, {}
+    for n in pages:
+        t = json.loads((d / f"p{n}_trace.json").read_text()) if (d / f"p{n}_trace.json").exists() else {}
+        pick = t.get("pick", {})
+        for kind in ("agree", "differ", "borrowed", "replaced"):  # 後ろのものほど優先
+            for m in t.get(kind, []):
+                cls[m] = kind
+        for m, c in pick.items():
+            cls[m] = (("replaced " if cls.get(m) == "replaced" else "pick ") + str(c if c in ("A", "B") else "neither")
+                      + (" (PDF)" if m in t.get("pick_glyph", []) else ""))
+        for st, f in t.get("flags", {}).items():
+            for m in f:
+                by.setdefault(m, []).append(st)
+    to_r = {i: str(j + 1) for i, j in res.pop("pairs")}
+    res["measures"] = [{"m": i + 1, "r": to_r.get(i), "right": ok, "class": cls.get(to_r.get(i), "none"),
+                        "flags": by.get(to_r.get(i), []), "at": {st: a[i] for st, a in at.items()}}
+                       for i, ok in enumerate(res["right"])]
+    return res
 
 
 class patched:
-    """読み取りを試験用にする: library/ には書かない、OMR の結果を使い回す。
-    raw は Claude を呼ぶ proof_page を空にする。full は本物 (呼び出し側が許可を確認済み)。"""
-    def __init__(self, stage):
-        self.stage = stage
+    """読み取りを試験用にする: library/ ではなく lib (run のフォルダ) に書く、OMR の結果を使い回す、steps の段だけを行う
+    (Claude を使う段は、呼び出し側が許可を確認済み)。"""
+    def __init__(self, lib, steps):
+        self.lib, self.steps = lib, steps
 
     def __enter__(self):
         self.saved = server.LIB, server.proof_page, server.subprocess
-        server.LIB = WORK / "lib"
+        server.LIB = self.lib
         server.subprocess = types.SimpleNamespace(run=cached_run(subprocess.run, WORK), DEVNULL=subprocess.DEVNULL)
-        if self.stage == "raw":
-            server.proof_page = lambda song, n: None
-        if self.stage == "pick":  # 2つの読み取りの食い違いを Claude に選ばせるところまで。決まらなかった小節に印を付ける
-            def pick(song, n):
-                server.cut_systems(server.LIB / song, n)
-                flags = server.pick_page(song, n)
-                server.update_meta(song, flags={**server.read_meta(song).get("flags", {}), **flags})
-            server.proof_page = pick
+        real = server.proof_page
+        server.proof_page = lambda song, n: real(song, n, self.steps)
 
     def __exit__(self, *a):
         server.LIB, server.proof_page, server.subprocess = self.saved
@@ -298,6 +375,7 @@ def report(runs):
         print(line("ALL", total(r["n"] for r in res.values())))
         for piece, r in res.items():
             print(line(piece, r["n"]))
+        provenance(res.values())
     for stage in dict.fromkeys(s for s, _ in runs):  # 段階ごとに、条件をまとめた dev (改善の判断に使う曲) と test の合計
         print(f"\n[{stage} / all conditions]")
         for split in ("dev", "test"):
@@ -305,6 +383,29 @@ def report(runs):
                   if p.startswith("test_") == (split == "test")]
             if ns:
                 print(line(split.upper(), total(ns)))
+
+
+def provenance(results):
+    """results: judge() の結果の並び。どの段が小節を直し、どの段が壊したか、間違いと印がどこから来たかを表にする。"""
+    ms = [m for r in results for m in r["measures"]]
+    points = [st for st in POINTS if any(st in m["at"] for m in ms)]
+    if len(points) > 1:
+        print("\n  段ごとの変化        合う  直した 壊した")
+        for a, b in zip([None] + points, points):
+            have = [m for m in ms if b in m["at"]]
+            fixed = sum(m["at"][b] and not m["at"].get(a, True) for m in have) if a else 0
+            broke = sum(not m["at"][b] and m["at"].get(a, False) for m in have) if a else 0
+            print(f"  {b:<16}{sum(m['at'][b] for m in have):>6}{fixed:>7}{broke:>7}")
+    print("\n  突き合わせの結果    小節  間違い  うち印なし  合っているのに印")
+    for c in sorted({m["class"] for m in ms}):
+        of = [m for m in ms if m["class"] == c]
+        print(f"  {c:<18}{len(of):>5}{sum(not m['right'] for m in of):>7}{sum(not m['right'] and not m['flags'] for m in of):>10}"
+              f"{sum(m['right'] and bool(m['flags']) for m in of):>14}")
+    print("\n  印を付けた段          印  間違いに  合っている小節に")
+    for st in POINTS:
+        of = [m for m in ms if st in m["flags"]]
+        if of:
+            print(f"  {st:<18}{len(of):>5}{sum(not m['right'] for m in of):>9}{sum(m['right'] for m in of):>12}")
 
 
 # ---------- 検算 ----------
@@ -377,42 +478,52 @@ def main(argv):
     only = [a[8:] for a in argv if a.startswith("--piece=")]
     conds = [a[7:] for a in argv if a.startswith("--cond=")] or list(CONDS)
     label = next((a[8:] for a in argv if a.startswith("--label=")), "")
+    src, start = next((a[7:].split(":") for a in argv if a.startswith("--from=")), (None, None))
     pieces = [p.stem for p in sorted(TRUTH.glob("*.musicxml"))
               if (p.stem in only if only else "--test" in argv or not p.stem.startswith("test_"))]
     if not stages or not pieces:
         raise SystemExit(__doc__)
+    if src and (not label or label == src or start not in POINTS[1:] or not (WORK / "runs" / src).exists()):
+        raise SystemExit("--from=名前:段 は、bench/work/runs にある run の名前と pick|proof|verify|audit|glyph、それと別の --label が要る")
     pages = {p: engrave(p) for p in pieces}
-    if "full" in stages or "pick" in stages:
+    if any(STAGES[s] for s in stages):
         n = sum(pages[p][c] for p in pieces for c in conds)
-        print(f"full は Claude を使う本番どおりの処理です。{n}ページ処理します (1ページ数分、Claude を10回前後呼ぶ)")
+        print(f"Claude を使う処理です (サブスクリプションを使う)。{n}ページ処理します")
         if "--yes-full" not in argv:
             raise SystemExit("実行するなら --yes-full を付ける")
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     dirty = bool(subprocess.run(["git", "status", "--porcelain", "--", "*.py"], capture_output=True, text=True).stdout.strip())
     runs = {}
     for stage in stages:
+        steps = STAGES[stage][STAGES[stage].index(start):] if src else STAGES[stage]
+        lib = WORK / "runs" / (label or stage)
+
         def one(job):
             p, cond = job
             t0 = time.time()
-            root, flags = read_song(p, cond, stage)
+            d = read_song(p, cond, steps, WORK / "runs" / src / f"{p}_{cond}" if src else None)
             print(f"{stage} {cond} {p}: {pages[p][cond]}ページ {time.time() - t0:.0f}秒", flush=True)
-            return score(ET.parse(TRUTH / f"{p}.musicxml").getroot(), root, flags)
+            return judge(ET.parse(TRUTH / f"{p}.musicxml").getroot(), d)
         jobs = [(p, c) for c in conds for p in pieces]
+        before = server.spent.copy()
         # 曲ごとに別のフォルダで動くので並べて走らせてよい。Claude の呼び出しは1曲の中でも6本まで並ぶ
-        with patched(stage), ThreadPoolExecutor(int(os.environ.get("BENCH_JOBS", 3))) as pool:
+        with patched(lib, steps), ThreadPoolExecutor(int(os.environ.get("BENCH_JOBS", 3))) as pool:
             for (p, c), r in zip(jobs, pool.map(one, jobs)):
                 runs.setdefault((stage, c), {})[p] = r
+        spent = {k: round(v, 2) for k, v in (server.spent - before).items()}
         name = f"results_{stage}{'_' + label if label else ''}.json"
         (WORK / name).write_text(json.dumps(
-            {"commit": commit, "dirty": dirty, "label": label,
-             **{c: {p: {"counts": r["n"], "right": r["right"], "wrong_measures": r["wrong"]} for p, r in runs[stage, c].items()}
-                for c in conds}}, ensure_ascii=False, indent=1))
+            {"commit": commit, "dirty": dirty, "label": label, "from": src and f"{src}:{start}", "claude": spent,
+             **{c: {p: {"counts": r["n"], "right": r["right"], "wrong_measures": r["wrong"], "measures": r["measures"]}
+                    for p, r in runs[stage, c].items()} for c in conds}}, ensure_ascii=False, indent=1))
         t = total(r["n"] for c in conds for r in runs[stage, c].values())
         with open(WORK / "history.jsonl", "a") as f:  # 試した策ごとの数字を1行ずつ残す
             f.write(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M"), "stage": stage, "label": label, "commit": commit,
-                                "dirty": dirty, "conds": conds, "pieces": pieces,
+                                "dirty": dirty, "from": src and f"{src}:{start}", "conds": conds, "pieces": pieces,
                                 **{k: t[k] for k in ("measures", "right_measures", "truth_notes", "correct", "flagged",
-                                                     "silent", "false_flags")}}, ensure_ascii=False) + "\n")
+                                                     "silent", "false_flags")}, "claude": spent}, ensure_ascii=False) + "\n")
+        if spent:
+            print(f"Claude: {spent}")
     report(runs)
 
 

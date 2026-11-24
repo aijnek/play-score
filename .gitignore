@@ -2,3 +2,5 @@ library/
 .venv/
 __pycache__/
 bench/
+購入PDF/
+.DS_Store
